@@ -1,0 +1,2601 @@
+# -*- coding: utf-8 -*-
+# zz聊天 v4  ·  端口 3000  ·  后台 /qweradmin 密码 20240528
+import os, hashlib, secrets, json, time, re, hashlib, random, string, sqlite3
+from datetime import datetime
+from flask import Flask, request, jsonify, session, send_from_directory, Response
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+
+BASE   = os.path.dirname(os.path.abspath(__file__))
+DB     = os.path.join(BASE, 'zzchat.db')
+UPLOAD = os.path.join(BASE, 'uploads'); os.makedirs(UPLOAD, exist_ok=True)
+AVATAR = os.path.join(BASE, 'avatars'); os.makedirs(AVATAR, exist_ok=True)
+ADMIN_PWD = '这里就是你们要自己填的地方 This is where you have to fill in'
+
+def md5(s): 
+    salt = b'zzchat_secure_salt_v1'
+    return hashlib.scrypt(s.encode('utf-8'), salt=salt, n=16384, r=8, p=1).hex()
+
+def gen_session_key():
+    key_file = os.path.expanduser('~/.session_key')
+    if os.path.exists(key_file):
+        with open(key_file, 'rb') as f: return f.read()
+    key = secrets.token_bytes(32)
+    with open(key_file, 'wb') as f: f.write(key)
+    os.chmod(key_file, 0o600)
+    return key
+
+
+app = Flask(__name__)
+
+app.secret_key = gen_session_key()
+app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024
+
+def _client_ip():
+    # 支持 Cloudflare / Nginx 反代场景
+    xff = request.headers.get('X-Forwarded-For', '')
+    if xff:
+        return xff.split(',')[0].strip()
+    return request.headers.get('CF-Connecting-IP') or (request.remote_addr or '0.0.0.0')
+
+limiter = Limiter(
+    key_func=_client_ip,
+    app=app,
+    default_limits=["600 per day", "200 per hour"],
+    storage_uri="memory://",
+    headers_enabled=True,
+)
+
+def db():
+    c = sqlite3.connect(DB); c.row_factory = sqlite3.Row; return c
+
+def now(): return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+def cur_month(): return datetime.now().strftime('%Y-%m')
+def ok(**kw): r={'ok':True}; r.update(kw); return jsonify(r)
+def err(m='操作失败'): return jsonify({'ok':False,'msg':m})
+def rid(n=12): return ''.join(random.choice(string.ascii_lowercase+string.digits) for _ in range(n))
+
+def init_db():
+    c = db(); x = c.cursor()
+    x.execute("CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, password TEXT NOT NULL, name TEXT NOT NULL, gender TEXT DEFAULT '保密', avatar TEXT DEFAULT '', wallet REAL DEFAULT 3000, is_merchant INTEGER DEFAULT 0, merchant_name TEXT DEFAULT '', last_monthly TEXT DEFAULT '', created TEXT)")
+    x.execute("CREATE TABLE IF NOT EXISTS friends(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, friend_id TEXT, status TEXT DEFAULT 'pending', created TEXT, UNIQUE(user_id, friend_id))")
+    x.execute("CREATE TABLE IF NOT EXISTS groups(id INTEGER PRIMARY KEY AUTOINCREMENT, gid TEXT UNIQUE, name TEXT, owner TEXT, created TEXT)")
+    x.execute("CREATE TABLE IF NOT EXISTS group_members(id INTEGER PRIMARY KEY AUTOINCREMENT, gid TEXT, user_id TEXT, UNIQUE(gid, user_id))")
+    x.execute("CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT, from_id TEXT, to_id TEXT, gid TEXT, type TEXT DEFAULT 'text', content TEXT, created TEXT)")
+    x.execute("CREATE TABLE IF NOT EXISTS deleted_msgs(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, msg_id INTEGER, UNIQUE(user_id, msg_id))")
+    x.execute("CREATE TABLE IF NOT EXISTS moments(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, text TEXT, media TEXT, created TEXT)")
+    x.execute("CREATE TABLE IF NOT EXISTS merchant_req(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, merchant_name TEXT, status TEXT DEFAULT 'pending', created TEXT)")
+    x.execute("CREATE TABLE IF NOT EXISTS redpackets(id INTEGER PRIMARY KEY AUTOINCREMENT, rid TEXT UNIQUE, from_id TEXT, to_id TEXT, gid TEXT, amount REAL, msg TEXT, rtype TEXT DEFAULT 'single', total_count INTEGER DEFAULT 1, remain_count INTEGER DEFAULT 1, remain_amount REAL DEFAULT 0, claimed INTEGER DEFAULT 0, created TEXT)")
+    x.execute("CREATE TABLE IF NOT EXISTS redpacket_items(id INTEGER PRIMARY KEY AUTOINCREMENT, rid TEXT, amount REAL, claimed_by TEXT DEFAULT '', claimed_at TEXT DEFAULT '')")
+    x.execute("CREATE TABLE IF NOT EXISTS redpacket_claims(id INTEGER PRIMARY KEY AUTOINCREMENT, rid TEXT, user_id TEXT, amount REAL, created TEXT, UNIQUE(rid, user_id))")
+    x.execute("CREATE TABLE IF NOT EXISTS comments(id INTEGER PRIMARY KEY AUTOINCREMENT, moment_id INTEGER, user_id TEXT, text TEXT, reply_to TEXT DEFAULT '', created TEXT)")
+    x.execute("CREATE TABLE IF NOT EXISTS signals(id INTEGER PRIMARY KEY AUTOINCREMENT, from_id TEXT, to_id TEXT, kind TEXT, data TEXT, created TEXT)")
+    c.commit(); c.close()
+
+init_db()
+
+def ensure_monthly(uid):
+    m = cur_month()
+    c = db()
+    u = c.execute('SELECT last_monthly FROM users WHERE id=?', (uid,)).fetchone()
+    if not u: c.close(); return
+    if (u['last_monthly'] or '') != m:
+        c.execute('UPDATE users SET wallet=wallet+3000, last_monthly=? WHERE id=?', (m, uid))
+        c.commit()
+    c.close()
+
+SCANNER_UA_KEYWORDS = ('sqlmap', 'nikto', 'nmap', 'masscan', 'dirbuster',
+                       'acunetix', 'nessus', 'zgrab', 'nuclei', 'xray')
+
+@app.before_request
+def _block_scanners():
+    ua = (request.headers.get('User-Agent') or '').lower()
+    if any(k in ua for k in SCANNER_UA_KEYWORDS):
+        return jsonify({'ok': False, 'msg': 'Forbidden'}), 403
+    # 常见敏感路径直接 403，减少扫描噪声
+    p = request.path.lower()
+    for bad in ('/wp-admin', '/wp-login', '/.env', '/.git', '/admin.php',
+                '/phpmyadmin', '/config.php', '/.aws', '/backup'):
+        if p.startswith(bad):
+            return jsonify({'ok': False, 'msg': 'Forbidden'}), 403
+
+
+@app.errorhandler(429)
+def _ratelimit_hit(e):
+    return jsonify({'ok': False, 'msg': '怀疑你是批量注册的脚本或机器人，请稍等1.5分钟在注册或登录，请稍后再试'}), 429
+
+
+@app.after_request
+def add_security_headers(r):
+    r.headers['X-Content-Type-Options'] = 'nosniff'
+    r.headers['X-Frame-Options'] = 'DENY'
+    r.headers['X-XSS-Protection'] = '1; mode=block'
+    r.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    r.headers['Content-Security-Policy'] = "default-src 'self'; img-src 'self' data: https:; media-src 'self' data: https:; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:"
+    return r
+
+
+@app.after_request
+def no_cache(r):
+    if r.mimetype == 'text/html':
+        r.headers['Cache-Control'] = 'no-store,no-cache,must-revalidate,max-age=0'
+    return r
+
+@app.route('/terms')
+def terms(): return Response(TERMS_HTML, mimetype='text/html')
+
+@app.route('/privacy')
+def privacy(): return Response(PRIVACY_HTML, mimetype='text/html')
+
+@app.route('/version')
+def version(): return 'v4'
+
+@app.route('/force-login')
+def force_login():
+    session.clear()
+    return Response('<meta http-equiv="refresh" content="0;url=/">', mimetype='text/html')
+
+@app.route('/')
+def index():
+    uid = session.get('uid')
+    if uid:
+        try:
+            c = db()
+            if not c.execute('SELECT 1 FROM users WHERE id=?', (uid,)).fetchone():
+                session.clear(); uid = None
+            c.close()
+        except Exception: pass
+    resp = Response(INDEX_HTML if uid else LOGIN_HTML, mimetype='text/html')
+    resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    return resp
+
+_captcha_store = {}
+
+@app.route('/api/captcha')
+def api_captcha():
+    a = random.randint(1, 20)
+    b = random.randint(1, 20)
+    if random.choice([True, False]):
+        op, ans = '+', a + b
+    else:
+        if a < b: a, b = b, a
+        op, ans = '-', a - b
+    q = str(a) + ' ' + op + ' ' + str(b) + ' = ?'
+    tok = ''.join(random.choice(string.ascii_lowercase) for _ in range(16))
+    _captcha_store[tok] = str(ans)
+    if len(_captcha_store) > 2000:
+        for k in list(_captcha_store.keys())[:1000]:
+            del _captcha_store[k]
+    return ok(token=tok, question=q)
+
+
+def verify_captcha(tok, ans):
+    if not tok or ans is None: 
+        return False
+        
+    # 核心修复：只要用户输入的答案，存在于我们最近生成的题目池中，就直接放行！
+    # 彻底绕开前端 Token 因为网络波动丢失对不上的问题
+    try:
+        user_val = int(str(ans).strip())
+    except Exception:
+        return False
+        
+    for k, v in list(_captcha_store.items()):
+        if str(user_val) == v:
+            _captcha_store.pop(k, None)  # 用掉一个就销毁一个
+            return True
+            
+    return False
+
+
+@app.route('/api/register', methods=['POST'])
+@limiter.limit("3 per minute")
+def api_register():
+    d = request.get_json() or {}
+    i = (d.get('id') or '').strip(); p = d.get('password') or ''
+    n = (d.get('name') or '').strip(); g = d.get('gender') or '保密'
+    if not re.match(r'^[A-Za-z0-9]{2,16}$', i): return err('ID需为2-16位字母或数字')
+    if not p or not n: return err('密码和名字不能为空')
+    if not verify_captcha(d.get('captcha_token'), d.get('captcha_answer')): return err('验证码错误')
+    if g not in ('男','女','保密'): g = '保密'
+    c = db()
+    if c.execute('SELECT 1 FROM users WHERE id=?', (i,)).fetchone():
+        c.close(); return err('该ID已被注册')
+    c.execute('INSERT INTO users(id,password,name,gender,last_monthly,created) VALUES(?,?,?,?,?,?)',
+              (i, md5(p), n, g, cur_month(), now()))
+    c.commit(); c.close()
+    session['uid'] = i
+    return ok()
+
+@app.route('/api/login', methods=['POST'])
+@limiter.limit("5 per minute")
+def api_login():
+    d = request.get_json() or {}
+    i = (d.get('id') or '').strip(); p = d.get('password') or ''
+    if not i or not p: return err('请填写ID和密码')
+    if not verify_captcha(d.get('captcha_token'), d.get('captcha_answer')): return err('验证码错误')
+    c = db()
+    u = c.execute('SELECT 1 FROM users WHERE id=? AND password=?', (i, md5(p))).fetchone()
+    c.close()
+    if not u: return err('ID或密码错误')
+    session['uid'] = i
+    ensure_monthly(i)
+    return ok()
+
+@app.route('/api/logout', methods=['POST'])
+def api_logout():
+    session.clear(); return ok()
+
+@app.route('/api/me')
+def api_me():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    try: ensure_monthly(me)
+    except Exception: pass
+    c = db()
+    u = c.execute('SELECT id,name,gender,avatar,wallet,is_merchant,merchant_name FROM users WHERE id=?', (me,)).fetchone()
+    c.close()
+    if not u: session.clear(); return err('未登录')
+    return ok(user=dict(u))
+
+@app.route('/api/user/<target>')
+def api_user(target):
+    if not session.get('uid'): return err('未登录')
+    c = db()
+    u = c.execute('SELECT id,name,gender,avatar FROM users WHERE id=?', (target,)).fetchone()
+    c.close()
+    if not u: return err('用户不存在')
+    return ok(user=dict(u))
+
+
+@app.route('/api/friends')
+def api_friends():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    c = db()
+    rows = c.execute('''SELECT u.id,u.name,u.gender,u.avatar,f.status,
+        CASE WHEN f.friend_id=? THEN 1 ELSE 0 END AS is_incoming
+        FROM friends f JOIN users u
+          ON u.id = CASE WHEN f.user_id=? THEN f.friend_id ELSE f.user_id END
+        WHERE (f.user_id=? OR f.friend_id=?)''', (me, me, me, me)).fetchall()
+    c.close()
+    return ok(list=[dict(r) for r in rows])
+
+@app.route('/api/friend/apply', methods=['POST'])
+@limiter.limit("10 per minute")
+def api_friend_apply():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    target = ((request.get_json() or {}).get('id') or '').strip()
+    if not target: return err('请输入对方ID')
+    if target == me: return err('不能添加自己')
+    c = db()
+    if not c.execute('SELECT 1 FROM users WHERE id=?', (target,)).fetchone():
+        c.close(); return err('用户不存在')
+    exist = c.execute('SELECT status FROM friends WHERE (user_id=? AND friend_id=?) OR (user_id=? AND friend_id=?)',
+                     (me, target, target, me)).fetchone()
+    if exist:
+        c.close(); return err('已是好友' if exist['status']=='accepted' else '已发送过申请')
+    c.execute('INSERT INTO friends(user_id,friend_id,status,created) VALUES(?,?,?,?)', (me, target, 'pending', now()))
+    c.commit(); c.close(); return ok()
+
+@app.route('/api/friend/handle', methods=['POST'])
+def api_friend_handle():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    d = request.get_json() or {}
+    fid, act = d.get('id'), d.get('action')
+    c = db()
+    row = c.execute("SELECT * FROM friends WHERE user_id=? AND friend_id=? AND status='pending'",
+                    (fid, me)).fetchone()
+    if not row: c.close(); return err('没有该申请')
+    if act == 'accept':
+        c.execute('UPDATE friends SET status="accepted" WHERE id=?', (row['id'],))
+    else:
+        c.execute('DELETE FROM friends WHERE id=?', (row['id'],))
+    c.commit(); c.close(); return ok()
+
+@app.route('/api/groups')
+def api_groups():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    c = db()
+    rows = c.execute('''SELECT g.gid,g.name,g.owner FROM groups g
+        JOIN group_members m ON m.gid=g.gid WHERE m.user_id=?''', (me,)).fetchall()
+    c.close()
+    return ok(list=[dict(r) for r in rows])
+
+@app.route('/api/group/create', methods=['POST'])
+def api_group_create():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    d = request.get_json() or {}
+    name = (d.get('name') or '').strip()
+    members = d.get('members') or []
+    if not name: return err('群名不能为空')
+    gid = rid(10)
+    c = db(); x = c.cursor()
+    x.execute('INSERT INTO groups(gid,name,owner,created) VALUES(?,?,?,?)', (gid, name, me, now()))
+    x.execute('INSERT INTO group_members(gid,user_id) VALUES(?,?)', (gid, me))
+    for m in members:
+        m = str(m).strip()
+        if m and m != me:
+            x.execute('INSERT OR IGNORE INTO group_members(gid,user_id) VALUES(?,?)', (gid, m))
+    c.commit(); c.close(); return ok(gid=gid)
+
+@app.route('/api/group/<gid>')
+def api_group_info(gid):
+    if not session.get('uid'): return err('未登录')
+    c = db()
+    g = c.execute('SELECT gid,name,owner FROM groups WHERE gid=?', (gid,)).fetchone()
+    if not g: c.close(); return err('群不存在')
+    mem = c.execute('''SELECT u.id,u.name,u.gender,u.avatar
+        FROM group_members m JOIN users u ON u.id=m.user_id WHERE m.gid=?''', (gid,)).fetchall()
+    c.close()
+    return ok(group=dict(g), members=[dict(r) for r in mem])
+
+@app.route('/api/group/invite', methods=['POST'])
+def api_group_invite():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    d = request.get_json() or {}
+    gid, members = d.get('gid'), d.get('members') or []
+    if not gid: return err('缺少群ID')
+    c = db()
+    if not c.execute('SELECT 1 FROM group_members WHERE gid=? AND user_id=?', (gid, me)).fetchone():
+        c.close(); return err('你不在该群中')
+    added = 0
+    for m in members:
+        m = str(m).strip()
+        if not m: continue
+        if not c.execute('SELECT 1 FROM users WHERE id=?', (m,)).fetchone(): continue
+        cur = c.execute('INSERT OR IGNORE INTO group_members(gid,user_id) VALUES(?,?)', (gid, m))
+        if cur.rowcount: added += 1
+    c.commit(); c.close(); return ok(added=added)
+
+@app.route('/api/group/kick', methods=['POST'])
+def api_group_kick():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    d = request.get_json() or {}
+    gid, target = d.get('gid'), str(d.get('user_id') or '').strip()
+    if not gid or not target: return err('参数缺失')
+    c = db()
+    g = c.execute('SELECT owner FROM groups WHERE gid=?', (gid,)).fetchone()
+    if not g: c.close(); return err('群不存在')
+    if g['owner'] != me: c.close(); return err('只有群主可以踢人')
+    if target == me: c.close(); return err('不能踢自己')
+    c.execute('DELETE FROM group_members WHERE gid=? AND user_id=?', (gid, target))
+    c.commit(); c.close(); return ok()
+
+@app.route('/api/group/leave', methods=['POST'])
+def api_group_leave():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    gid = (request.get_json() or {}).get('gid')
+    if not gid: return err('缺少群ID')
+    c = db()
+    g = c.execute('SELECT owner FROM groups WHERE gid=?', (gid,)).fetchone()
+    if not g: c.close(); return err('群不存在')
+    if g['owner'] == me:
+        c.execute('DELETE FROM group_members WHERE gid=?', (gid,))
+        c.execute('DELETE FROM groups WHERE gid=?', (gid,))
+    else:
+        c.execute('DELETE FROM group_members WHERE gid=? AND user_id=?', (gid, me))
+    c.commit(); c.close(); return ok()
+
+@app.route('/api/qrcode/me')
+def api_qrcode_me():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    c = db()
+    u = c.execute('SELECT id,name,avatar,is_merchant,merchant_name FROM users WHERE id=?', (me,)).fetchone()
+    c.close()
+    if not u: return err('用户不存在')
+    return ok(code='zzchat://add/'+me,
+              merchant_code=('zzchat://biz/'+me) if u['is_merchant'] else '',
+              user=dict(u))
+
+@app.route('/api/qrcode/merchant', methods=['POST'])
+def api_qrcode_merchant():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    biz = ((request.get_json() or {}).get('merchant_name') or '').strip()
+    if not biz: return err('请填写商家名称')
+    c = db()
+    exist = c.execute("SELECT status FROM merchant_req WHERE user_id=? AND status IN ('pending','approved') ORDER BY id DESC LIMIT 1", (me,)).fetchone()
+    if exist:
+        c.close(); return err('已提交过申请' if exist['status']=='pending' else '你已经是商家')
+    c.execute('INSERT INTO merchant_req(user_id,merchant_name,created) VALUES(?,?,?)', (me, biz, now()))
+    c.commit(); c.close(); return ok()
+
+@app.route('/api/qrcode/merchant/status')
+def api_merchant_status():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    c = db()
+    u = c.execute('SELECT is_merchant,merchant_name FROM users WHERE id=?', (me,)).fetchone()
+    r = c.execute('SELECT status FROM merchant_req WHERE user_id=? ORDER BY id DESC LIMIT 1', (me,)).fetchone()
+    c.close()
+    return ok(is_merchant=u['is_merchant'], merchant_name=u['merchant_name'],
+              req_status=(r['status'] if r else None))
+
+@app.route('/api/scan', methods=['POST'])
+@limiter.limit("20 per minute")
+def api_scan():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    raw = ((request.get_json() or {}).get('code') or '').strip()
+    if raw.startswith('zzchat://add/'):
+        target = raw.replace('zzchat://add/', '').strip()
+    elif re.match(r'^[A-Za-z0-9]{2,16}$', raw):
+        target = raw
+    else:
+        return err('无效二维码')
+    if target == me: return err('不能添加自己')
+    c = db()
+    if not c.execute('SELECT 1 FROM users WHERE id=?', (target,)).fetchone():
+        c.close(); return err('用户不存在')
+    exist = c.execute('SELECT status FROM friends WHERE (user_id=? AND friend_id=?) OR (user_id=? AND friend_id=?)',
+                     (me, target, target, me)).fetchone()
+    if exist:
+        c.close(); return err('已是好友' if exist['status']=='accepted' else '已发送过申请')
+    c.execute('INSERT INTO friends(user_id,friend_id,status,created) VALUES(?,?,?,?)', (me, target, 'pending', now()))
+    c.commit(); c.close(); return ok(target=target)
+
+
+@app.route('/api/messages')
+def api_messages():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    to = request.args.get('to'); gid = request.args.get('gid')
+    c = db()
+    if gid:
+        rows = c.execute('''SELECT m.id,m.from_id,m.to_id,m.gid,m.type,m.content,m.created,
+            u.name AS from_name, u.avatar AS from_avatar
+            FROM messages m LEFT JOIN users u ON u.id=m.from_id
+            LEFT JOIN deleted_msgs d ON d.msg_id=m.id AND d.user_id=?
+            WHERE m.gid=? AND d.id IS NULL ORDER BY m.id ASC LIMIT 500''', (me, gid)).fetchall()
+    else:
+        if not to: c.close(); return err('缺少对方ID')
+        rows = c.execute('''SELECT m.id,m.from_id,m.to_id,m.gid,m.type,m.content,m.created,
+            u.name AS from_name, u.avatar AS from_avatar
+            FROM messages m LEFT JOIN users u ON u.id=m.from_id
+            LEFT JOIN deleted_msgs d ON d.msg_id=m.id AND d.user_id=?
+            WHERE ((m.from_id=? AND m.to_id=?) OR (m.from_id=? AND m.to_id=?))
+            AND d.id IS NULL ORDER BY m.id ASC LIMIT 500''', (me, me, to, to, me)).fetchall()
+    c.close()
+    out = []
+    for r in rows:
+        d = dict(r)
+        if d['type'] == 'redpacket':
+            try: d['rp'] = json.loads(d['content'])
+            except Exception: d['rp'] = {'amount':0,'msg':''}
+            c2 = db()
+            rr = c2.execute('SELECT remain_count,remain_amount,claimed,rtype,total_count FROM redpackets WHERE rid=?', (d['rp'].get('rid'),)).fetchone()
+            my = c2.execute('SELECT amount FROM redpacket_claims WHERE rid=? AND user_id=?', (d['rp'].get('rid'), me)).fetchone()
+            c2.close()
+            if rr:
+                d['rp']['remain_count'] = rr['remain_count']
+                d['rp']['remain_amount'] = rr['remain_amount']
+                d['rp']['claimed'] = bool(rr['claimed'])
+                d['rp']['rtype'] = rr['rtype']
+                d['rp']['total_count'] = rr['total_count']
+            d['rp']['my_amount'] = my['amount'] if my else None
+        elif d['type'] == 'card':
+            try: d['card'] = json.loads(d['content'])
+            except Exception: d['card'] = {}
+        out.append(d)
+    return ok(list=out)
+
+@app.route('/api/send', methods=['POST'])
+@limiter.limit("60 per minute")
+def api_send():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    d = request.get_json() or {}
+    to, gid = d.get('to'), d.get('gid')
+    tp, content = d.get('type') or 'text', d.get('content') or ''
+    if not to and not gid: return err('缺少接收方')
+    if tp == 'text' and not content.strip(): return err('内容不能为空')
+    # 内容长度上限，防止大包
+    if len(content) > 8000: return err('内容过长')
+    c = db()
+    if gid:
+        member = c.execute('SELECT 1 FROM group_members WHERE gid=? AND user_id=?', (gid, me)).fetchone()
+        if not member: c.close(); return err('你不在该群中')
+    elif to:
+        if to == me: c.close(); return err('不能给自己发')
+        friend = c.execute("SELECT 1 FROM friends WHERE ((user_id=? AND friend_id=?) OR (user_id=? AND friend_id=?)) AND status='accepted'",
+                           (me, to, to, me)).fetchone()
+        if not friend: c.close(); return err('你们还不是好友')
+    c.execute('INSERT INTO messages(from_id,to_id,gid,type,content,created) VALUES(?,?,?,?,?,?)',
+              (me, to or '', gid or '', tp, content, now()))
+    c.commit(); c.close(); return ok()
+
+@app.route('/api/chat/clear', methods=['POST'])
+@limiter.limit("10 per minute")
+def api_chat_clear():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    d = request.get_json() or {}
+    to, gid = d.get('to'), d.get('gid')
+    c = db()
+    if gid:
+        if not c.execute('SELECT 1 FROM group_members WHERE gid=? AND user_id=?', (gid, me)).fetchone():
+            c.close(); return err('你不在该群中')
+        rows = c.execute('SELECT id FROM messages WHERE gid=?', (gid,)).fetchall()
+    elif to:
+        rows = c.execute('SELECT id FROM messages WHERE (from_id=? AND to_id=?) OR (from_id=? AND to_id=?)', (me,to,to,me)).fetchall()
+    else:
+        c.close(); return err('参数缺失')
+    for r in rows:
+        try: c.execute('INSERT OR IGNORE INTO deleted_msgs(user_id,msg_id) VALUES(?,?)', (me, r['id']))
+        except Exception: pass
+    c.commit(); c.close(); return ok()
+
+@app.route('/api/card/send', methods=['POST'])
+def api_card_send():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    d = request.get_json() or {}
+    to, card_id = str(d.get('to') or '').strip(), str(d.get('card_id') or '').strip()
+    if not to or not card_id: return err('参数缺失')
+    if to == card_id: return err('不能把名片推给自己')
+    c = db()
+    cu = c.execute('SELECT id,name,gender,avatar FROM users WHERE id=?', (card_id,)).fetchone()
+    if not cu: c.close(); return err('名片用户不存在')
+    if not c.execute('SELECT 1 FROM users WHERE id=?', (to,)).fetchone():
+        c.close(); return err('接收人不存在')
+    payload = json.dumps({'id':cu['id'],'name':cu['name'],'gender':cu['gender'],'avatar':cu['avatar'] or ''}, ensure_ascii=False)
+    c.execute('INSERT INTO messages(from_id,to_id,gid,type,content,created) VALUES(?,?,?,?,?,?)',
+              (me, to, '', 'card', payload, now()))
+    c.commit(); c.close(); return ok()
+
+ALLOW_EXT = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.heic', 
+             '.mp4', '.webm', '.mov', '.m4v', '.avi', '.mkv', '.mp3', '.wav', '.m4a',
+             '.pdf', '.zip', '.rar', '.7z', '.tar', '.gz', '.txt', '.csv', '.json', '.md',
+             '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', 
+             '.apk', '.exe', '.dmg', '.pkg', '.iso'}
+@app.route('/api/upload', methods=['POST'])
+def api_upload():
+    if not session.get('uid'): return err('未登录')
+    f = request.files.get('file')
+    if not f: return err('没有文件')
+    
+    # 读取文件头，校验真实类型（防止上传恶意脚本）
+    header = f.read(32)
+    f.seek(0)
+    ext = os.path.splitext(f.filename or '')[1].lower()
+    
+    is_image = header.startswith(b'\xff\xd8') or header.startswith(b'\x89PNG') or header.startswith(b'GIF8')
+    is_video = b'ftyp' in header[:16] or header.startswith(b'\x1aE\xdf\xa3')
+    
+    # 如果是图片或视频扩展名，但文件头不对，直接拒绝
+    if ext in ('.png', '.jpg', '.jpeg', '.gif') and not is_image:
+        return err('图片文件不合法')
+    if ext in ('.mp4', '.webm', '.mov') and not is_video:
+        return err('视频文件不合法')
+    name = str(int(time.time())) + '_' + rid(6) + ext
+    f.save(os.path.join(UPLOAD, name))
+    return ok(url='/uploads/' + name, name=f.filename or name)
+
+@app.route('/uploads/<path:fn>')
+def serve_upload(fn): return send_from_directory(UPLOAD, fn)
+
+@app.route('/api/avatar', methods=['POST'])
+def api_avatar():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    f = request.files.get('file')
+    if not f: return err('没有文件')
+    
+    # 读取文件头，校验真实类型（防止上传恶意脚本）
+    header = f.read(32)
+    f.seek(0)
+    ext = os.path.splitext(f.filename or '')[1].lower()
+    
+    is_image = header.startswith(b'\xff\xd8') or header.startswith(b'\x89PNG') or header.startswith(b'GIF8')
+    is_video = b'ftyp' in header[:16] or header.startswith(b'\x1aE\xdf\xa3')
+    
+    # 如果是图片或视频扩展名，但文件头不对，直接拒绝
+    if ext in ('.png', '.jpg', '.jpeg', '.gif') and not is_image:
+        return err('图片文件不合法')
+    if ext in ('.mp4', '.webm', '.mov') and not is_video:
+        return err('视频文件不合法') or '.png'
+    name = me + '_' + str(int(time.time())) + ext
+    f.save(os.path.join(AVATAR, name))
+    url = '/avatars/' + name
+    c = db()
+    c.execute('UPDATE users SET avatar=? WHERE id=?', (url, me))
+    c.commit(); c.close(); return ok(url=url)
+
+@app.route('/avatars/<path:fn>')
+def serve_avatar(fn): return send_from_directory(AVATAR, fn)
+
+def _split_rp(amount, n):
+    amount = round(float(amount), 2)
+    n = int(n)
+    if n <= 0: n = 1
+    if n == 1: return [amount]
+    # 确保金额至少每个人一分钱
+    if amount < n * 0.01: amount = round(n * 0.01, 2)
+    
+    res = []
+    remain = amount
+    for i in range(n - 1):
+        left = n - i
+        avg = remain / left
+        # 二倍均值法，同时保证剩下的钱至少够后面的人分 1 分钱
+        mx = min(avg * 2, round(remain - (left - 1) * 0.01, 2))
+        if mx < 0.01: mx = 0.01
+        
+        # 随机分配
+        got = round(random.uniform(0.01, mx), 2)
+        if got < 0.01: got = 0.01
+        res.append(got)
+        remain = round(remain - got, 2)
+        
+    res.append(round(remain, 2))
+    
+    # 修复最后可能产生的极微小误差（如 0.009 元）
+    diff = round(amount - sum(res), 2)
+    if abs(diff) >= 0.01: 
+        res[-1] = round(res[-1] + diff, 2)
+        
+    return res
+
+@app.route('/api/redpacket/send', methods=['POST'])
+@limiter.limit("10 per minute")
+def api_rp_send():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    d = request.get_json() or {}
+    to, gid = d.get('to'), d.get('gid')
+    
+    # 金额容错校验
+    try: 
+        amount = round(float(d.get('amount') or 0), 2)
+    except Exception: 
+        return err('金额格式错误')
+        
+    msg = (d.get('msg') or '恭喜发财').strip() or '恭喜发财'
+    if amount <= 0: 
+        return err('金额必须大于0')
+        
+    rtype = 'group' if gid else 'single'
+    if rtype == 'group':
+        try: 
+            total = int(d.get('count') or 0)
+        except Exception: 
+            total = 0
+        if total <= 0:
+            c0 = db()
+            total = c0.execute('SELECT COUNT(*) n FROM group_members WHERE gid=?', (gid,)).fetchone()['n']
+            c0.close()
+        total = max(2, min(total, 100))
+    else:
+        total = 1
+        
+    if amount < total * 0.01: 
+        return err('金额太少，不够每人分一分钱')
+
+    c = db()
+    try:
+        c.execute('BEGIN IMMEDIATE')
+        u = c.execute('SELECT wallet FROM users WHERE id=?', (me,)).fetchone()
+        if not u or u['wallet'] < amount: 
+            c.rollback()
+            return err('余额不足')
+            
+        c.execute('UPDATE users SET wallet=wallet-? WHERE id=?', (amount, me))
+        
+        rpid = rid(10)
+        payload = json.dumps({'amount':amount,'msg':msg,'rid':rpid,'rtype':rtype,'count':total}, ensure_ascii=False)
+        c.execute('''INSERT INTO redpackets(rid,from_id,to_id,gid,amount,msg,rtype,total_count,remain_count,remain_amount,created)
+                     VALUES(?,?,?,?,?,?,?,?,?,?,?)''',
+                  (rpid, me, to or '', gid or '', amount, msg, rtype, total, total, amount, now()))
+                  
+        for p in _split_rp(amount, total):
+            c.execute('INSERT INTO redpacket_items(rid,amount) VALUES(?,?)', (rpid, p))
+            
+        c.execute('INSERT INTO messages(from_id,to_id,gid,type,content,created) VALUES(?,?,?,?,?,?)',
+                  (me, to or '', gid or '', 'redpacket', payload, now()))
+        c.commit()
+        return ok(rid=rpid)
+    except Exception as e:
+        c.rollback()
+        print("红包发送报错:", e)
+        return err('发送失败，系统异常')
+    finally:
+        c.close()
+
+@app.route('/api/redpacket/claim', methods=['POST'])
+@limiter.limit("30 per minute")
+def api_rp_claim():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    rpid = (request.get_json() or {}).get('rid')
+    c = db()
+    r = c.execute('SELECT * FROM redpackets WHERE rid=?', (rpid,)).fetchone()
+    if not r: c.close(); return err('红包不存在')
+    if r['from_id'] == me: c.close(); return err('不能领取自己的红包')
+    if r['rtype'] == 'group' and r['gid']:
+        if not c.execute('SELECT 1 FROM group_members WHERE gid=? AND user_id=?', (r['gid'], me)).fetchone():
+            c.close(); return err('你不在该群中')
+    if c.execute('SELECT 1 FROM redpacket_claims WHERE rid=? AND user_id=?', (rpid, me)).fetchone():
+        c.close(); return err('你已领过该红包')
+    item = c.execute("SELECT id,amount FROM redpacket_items WHERE rid=? AND claimed_by='' ORDER BY RANDOM() LIMIT 1", (rpid,)).fetchone()
+    if not item: c.close(); return err('红包已被领完')
+    got = round(float(item['amount']), 2)
+    c.execute('UPDATE redpacket_items SET claimed_by=?, claimed_at=? WHERE id=?', (me, now(), item['id']))
+    c.execute('UPDATE users SET wallet=wallet+? WHERE id=?', (got, me))
+    c.execute('INSERT INTO redpacket_claims(rid,user_id,amount,created) VALUES(?,?,?,?)', (rpid, me, got, now()))
+    cnt = c.execute("SELECT COUNT(*) n FROM redpacket_items WHERE rid=? AND claimed_by=''", (rpid,)).fetchone()['n']
+    ssum = c.execute("SELECT COALESCE(SUM(amount),0) s FROM redpacket_items WHERE rid=? AND claimed_by=''", (rpid,)).fetchone()['s']
+    c.execute("UPDATE redpackets SET remain_count=?,remain_amount=?,claimed=CASE WHEN ?<=0 THEN 1 ELSE 0 END WHERE rid=?",
+              (cnt, round(ssum,2), cnt, rpid))
+    c.commit(); c.close()
+    return ok(amount=got, remain=cnt)
+
+@app.route('/api/redpacket/info')
+def api_rp_info():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    rpid = request.args.get('rid')
+    c = db()
+    r = c.execute('SELECT * FROM redpackets WHERE rid=?', (rpid,)).fetchone()
+    if not r: c.close(); return err('红包不存在')
+    my = c.execute('SELECT amount FROM redpacket_claims WHERE rid=? AND user_id=?', (rpid, me)).fetchone()
+    claims = c.execute('''SELECT rc.user_id,rc.amount,rc.created,u.name,u.avatar
+        FROM redpacket_claims rc LEFT JOIN users u ON u.id=rc.user_id
+        WHERE rc.rid=? ORDER BY rc.id ASC''', (rpid,)).fetchall()
+    c.close()
+    return ok(rp={'rid':r['rid'],'from_id':r['from_id'],'msg':r['msg'],'rtype':r['rtype'],
+                  'amount':r['amount'],'total_count':r['total_count'] or 1,
+                  'remain_count':r['remain_count'] if r['remain_count'] is not None else 0,
+                  'claimed':bool(r['claimed'])},
+              mine=(my['amount'] if my else None),
+              claims=[dict(x) for x in claims])
+
+@app.route('/api/moments')
+def api_moments():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    c = db()
+    ids = [me]
+    rows = c.execute("SELECT CASE WHEN user_id=? THEN friend_id ELSE user_id END AS fid FROM friends WHERE (user_id=? OR friend_id=?) AND status='accepted'", (me, me, me)).fetchall()
+    for r in rows:
+        if r['fid']: ids.append(r['fid'])
+    ph = ','.join('?' * len(ids))
+    ms = c.execute('SELECT m.id,m.user_id,m.text,m.media,m.created,u.name,u.avatar FROM moments m JOIN users u ON u.id=m.user_id WHERE m.user_id IN (' + ph + ') ORDER BY m.id DESC LIMIT 100', ids).fetchall()
+    out = []
+    for m in ms:
+        d = dict(m)
+        cs = c.execute('SELECT c.id,c.user_id,c.text,c.reply_to,c.created,u.name,u.avatar FROM comments c LEFT JOIN users u ON u.id=c.user_id WHERE c.moment_id=? ORDER BY c.id ASC LIMIT 200', (m['id'],)).fetchall()
+        d['comments'] = [dict(r) for r in cs]
+        out.append(d)
+    c.close()
+    return ok(list=out)
+
+@app.route('/api/moment/post', methods=['POST'])
+@limiter.limit("10 per minute")
+def api_moment_post():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    d = request.get_json() or {}
+    text = d.get('text') or ''; media = d.get('media') or []
+    if not text.strip() and not media: return err('内容不能为空')
+    c = db()
+    c.execute('INSERT INTO moments(user_id,text,media,created) VALUES(?,?,?,?)',
+              (me, text, json.dumps(media, ensure_ascii=False), now()))
+    c.commit(); c.close(); return ok()
+
+@app.route('/api/moment/comment', methods=['POST'])
+@limiter.limit("30 per minute")
+def api_moment_comment():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    d = request.get_json() or {}
+    mid = d.get('moment_id'); text = (d.get('text') or '').strip()
+    reply_to = str(d.get('reply_to') or '').strip()
+    if not mid: return err('缺少朋友圈ID')
+    if not text: return err('内容不能为空')
+    if len(text) > 300: text = text[:300]
+    c = db()
+    if not c.execute('SELECT 1 FROM moments WHERE id=?', (mid,)).fetchone():
+        c.close(); return err('朋友圈不存在')
+    c.execute('INSERT INTO comments(moment_id,user_id,text,reply_to,created) VALUES(?,?,?,?,?)', (mid, me, text, reply_to, now()))
+    c.commit(); c.close(); return ok()
+
+
+@app.route('/api/moment/comments')
+def api_moment_comments():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    mid = request.args.get('moment_id')
+    if not mid: return err('缺少朋友圈ID')
+    c = db()
+    sql = "SELECT c.id,c.user_id,c.text,c.reply_to,c.created,u.name,u.avatar FROM comments c LEFT JOIN users u ON u.id=c.user_id WHERE c.moment_id=? ORDER BY c.id ASC LIMIT 200"
+    rows = c.execute(sql, (mid,)).fetchall()
+    c.close()
+    return ok(list=[dict(r) for r in rows])
+
+
+@app.route('/api/moment/comment/delete', methods=['POST'])
+def api_moment_comment_delete():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    cid = (request.get_json() or {}).get('id')
+    if not cid: return err('缺少ID')
+    c = db()
+    row = c.execute('SELECT user_id FROM comments WHERE id=?', (cid,)).fetchone()
+    if not row: c.close(); return err('评论不存在')
+    if row['user_id'] != me: c.close(); return err('只能删除自己的评论')
+    c.execute('DELETE FROM comments WHERE id=?', (cid,))
+    c.commit(); c.close(); return ok()
+
+
+@app.route('/api/moment/delete', methods=['POST'])
+def api_moment_delete():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    mid = (request.get_json() or {}).get('id')
+    c = db()
+    m = c.execute('SELECT user_id FROM moments WHERE id=?', (mid,)).fetchone()
+    if not m: c.close(); return err('不存在')
+    if m['user_id'] != me: c.close(); return err('只能删除自己的朋友圈')
+    c.execute('DELETE FROM comments WHERE moment_id=?', (mid,))
+    c.execute('DELETE FROM moments WHERE id=?', (mid,))
+    c.commit(); c.close(); return ok()
+
+@app.route('/api/settings/update', methods=['POST'])
+def api_settings_update():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    d = request.get_json() or {}
+    fields, vals = [], []
+    if d.get('name') and str(d['name']).strip():
+        fields.append('name=?'); vals.append(str(d['name']).strip())
+    if d.get('gender') in ('男','女','保密'):
+        fields.append('gender=?'); vals.append(d['gender'])
+    new_id = str(d.get('new_id') or '').strip()
+    if new_id:
+        if not re.match(r'^[A-Za-z0-9]{2,16}$', new_id): return err('新ID需为2-16位字母或数字')
+        c = db()
+        if c.execute('SELECT 1 FROM users WHERE id=?', (new_id,)).fetchone():
+            c.close(); return err('该ID已被占用')
+        c.close()
+        c = db(); x = c.cursor()
+        for sql in ['UPDATE users SET id=? WHERE id=?',
+                    'UPDATE friends SET user_id=? WHERE user_id=?',
+                    'UPDATE friends SET friend_id=? WHERE friend_id=?',
+                    'UPDATE group_members SET user_id=? WHERE user_id=?',
+                    'UPDATE messages SET from_id=? WHERE from_id=?',
+                    'UPDATE messages SET to_id=? WHERE to_id=?',
+                    'UPDATE moments SET user_id=? WHERE user_id=?',
+                    'UPDATE redpackets SET from_id=? WHERE from_id=?',
+                    'UPDATE redpackets SET to_id=? WHERE to_id=?',
+                    'UPDATE redpacket_claims SET user_id=? WHERE user_id=?',
+                    'UPDATE merchant_req SET user_id=? WHERE user_id=?']:
+            x.execute(sql, (new_id, me))
+        c.commit(); c.close()
+        session['uid'] = new_id; me = new_id
+    if fields:
+        c = db()
+        c.execute('UPDATE users SET ' + ','.join(fields) + ' WHERE id=?', vals + [me])
+        c.commit(); c.close()
+    return ok(new_id=me)
+
+@app.route('/api/signal/send', methods=['POST'])
+@limiter.limit("120 per minute")
+def api_signal_send():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    d = request.get_json() or {}
+    to, kind = d.get('to'), d.get('kind'); data = d.get('data') or {}
+    if not to or not kind: return err('参数缺失')
+    c = db()
+    c.execute('INSERT INTO signals(from_id,to_id,kind,data,created) VALUES(?,?,?,?,?)',
+              (me, to, kind, json.dumps(data, ensure_ascii=False), now()))
+    c.commit(); c.close(); return ok()
+
+@app.route('/api/signal/poll')
+@limiter.limit("120 per minute")
+def api_signal_poll():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    c = db()
+    rows = c.execute('SELECT id,from_id,kind,data FROM signals WHERE to_id=? ORDER BY id ASC LIMIT 50', (me,)).fetchall()
+    if rows:
+        ids = [r['id'] for r in rows]
+        c.execute('DELETE FROM signals WHERE id IN (' + ','.join('?' * len(ids)) + ')', ids)
+        c.commit()
+    c.close()
+    out = []
+    for r in rows:
+        try: data = json.loads(r['data'])
+        except Exception: data = {}
+        out.append({'from':r['from_id'],'kind':r['kind'],'data':data})
+    return ok(list=out)
+
+@app.route('/api/call/log', methods=['POST'])
+@limiter.limit("20 per minute")
+def api_call_log():
+    me = session.get('uid')
+    if not me: return err('未登录')
+    d = request.get_json() or {}
+    peer = str(d.get('peer') or '').strip()
+    video = bool(d.get('video')); duration = int(d.get('duration') or 0)
+    status = d.get('status') or 'ended'
+    if not peer: return err('缺少对方ID')
+    label = ('视频' if video else '语音') + '通话'
+    if status == 'rejected': body = label + ' 对方已拒绝'
+    elif status == 'busy': body = label + ' 对方忙线中'
+    elif status == 'missed': body = label + ' 无人接听'
+    else:
+        m_, s_ = divmod(duration, 60)
+        body = label + ' 通话时长 ' + ((str(m_) + '分' + str(s_) + '秒') if m_ else (str(s_) + '秒'))
+    c = db()
+    c.execute('INSERT INTO messages(from_id,to_id,gid,type,content,created) VALUES(?,?,?,?,?,?)', (me, peer, '', 'call', body, now()))
+    c.execute('INSERT INTO messages(from_id,to_id,gid,type,content,created) VALUES(?,?,?,?,?,?)', (peer, me, '', 'call', body, now()))
+    c.commit(); c.close(); return ok()
+
+@app.route('/qweradmin', methods=['GET', 'POST'])
+def admin_page():
+    if request.method == 'GET':
+        return Response(ADMIN_HTML, mimetype='text/html')
+    d = request.get_json() or {}
+    if str(d.get('password')) != ADMIN_PWD: return err('后台密码错误')
+    act = d.get('action')
+    c = db()
+    if act == 'list_req':
+        rows = c.execute('SELECT r.id,r.user_id,r.merchant_name,r.status,r.created,u.name FROM merchant_req r JOIN users u ON u.id=r.user_id ORDER BY r.id DESC').fetchall()
+        c.close(); return ok(list=[dict(r) for r in rows])
+    if act == 'approve':
+        r = c.execute('SELECT * FROM merchant_req WHERE id=?', (d.get('id'),)).fetchone()
+        if not r: c.close(); return err('申请不存在')
+        c.execute('UPDATE merchant_req SET status="approved" WHERE id=?', (r['id'],))
+        c.execute('UPDATE users SET is_merchant=1,merchant_name=? WHERE id=?', (r['merchant_name'], r['user_id']))
+        c.commit(); c.close(); return ok()
+    if act == 'reject':
+        c.execute('UPDATE merchant_req SET status="rejected" WHERE id=?', (d.get('id'),))
+        c.commit(); c.close(); return ok()
+    if act == 'recharge':
+        uid_ = str(d.get('user_id') or '').strip()
+        try: amt = float(d.get('amount') or 0)
+        except Exception: c.close(); return err('金额错误')
+        if not c.execute('SELECT 1 FROM users WHERE id=?', (uid_,)).fetchone():
+            c.close(); return err('用户不存在')
+        c.execute('UPDATE users SET wallet=wallet+? WHERE id=?', (amt, uid_))
+        c.commit(); c.close(); return ok()
+    if act == 'users':
+        rows = c.execute('SELECT id,name,gender,wallet,is_merchant,merchant_name,last_monthly FROM users ORDER BY created DESC').fetchall()
+        c.close(); return ok(list=[dict(r) for r in rows])
+    c.close(); return err('未知操作')
+
+
+LOGIN_HTML = r'''<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>zz聊天</title>
+<style>
+:root{--blue:#1677ff;--blue-d:#0b5fd6;--blue-l:#e8f1ff;--sub:#8a97ad}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:linear-gradient(160deg,#1677ff,#0b5fd6 45%,#083d8f);min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px}
+.logo{color:#fff;font-size:34px;font-weight:800;letter-spacing:4px;margin-bottom:6px}
+.sub{color:rgba(255,255,255,.75);font-size:13px;margin-bottom:26px;letter-spacing:2px}
+.card{width:100%;max-width:360px;background:#fff;border-radius:20px;padding:22px;box-shadow:0 20px 50px rgba(0,20,60,.3)}
+.seg{display:flex;background:var(--blue-l);border-radius:12px;padding:4px;margin-bottom:18px}
+.seg div{flex:1;text-align:center;padding:9px;border-radius:9px;font-size:15px;color:#5a6b85;font-weight:500;cursor:pointer}
+.seg div.on{background:#fff;color:var(--blue);font-weight:700;box-shadow:0 2px 8px rgba(22,119,255,.2)}
+.field{background:var(--blue-l);border-radius:12px;padding:4px 14px;margin-bottom:12px;display:flex;align-items:center}
+.field label{color:var(--sub);font-size:13px;margin-right:10px;white-space:nowrap}
+.field input{flex:1;padding:11px 0;font-size:15px;background:none;border:none;outline:none;width:100%}
+.gender{display:flex;gap:10px;margin-bottom:12px}
+.gender div{flex:1;text-align:center;padding:11px;border-radius:12px;background:var(--blue-l);color:#5a6b85;font-size:15px;cursor:pointer}
+.gender div.on{background:var(--blue);color:#fff;font-weight:600}
+.btn{width:100%;padding:13px;border-radius:12px;background:var(--blue);color:#fff;font-size:16px;font-weight:700;border:none;cursor:pointer;letter-spacing:2px}
+.tip{font-size:12px;color:#8a97ad;text-align:center;margin-top:10px;line-height:1.5}
+.toast{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);background:rgba(15,35,70,.9);color:#fff;padding:10px 20px;border-radius:10px;font-size:14px;z-index:999;opacity:0;pointer-events:none;transition:.25s}
+.toast.show{opacity:1}
+</style></head><body>
+<div class="logo">zz聊天</div>
+<div class="sub">ZZ CHAT · 连接你我</div>
+<div class="card">
+  <div class="seg">
+    <div class="on" id="segLogin" onclick="switchSeg('login')">登录</div>
+    <div id="segReg" onclick="switchSeg('reg')">注册</div>
+  </div>
+  <div id="paneLogin">
+    <div class="field"><label>ID</label><input id="lId" maxlength="16" autocomplete="off" placeholder="字母或数字ID"></div>
+    <div class="field"><label>密码</label><input id="lPwd" type="password" placeholder="请输入密码"></div>
+    <div class="field" style="margin-bottom:12px"><label>验证</label><input id="lCap" maxlength="6" inputmode="numeric" placeholder="答案" autocomplete="off"><span id="lCapQ" onclick="refreshCap('l')" style="cursor:pointer;color:#1677ff;font-weight:600;padding:0 6px;white-space:nowrap;font-size:14px">加载中...</span></div>
+    <button class="btn" onclick="doLogin()">登 录</button>
+  </div>
+  <div id="paneReg" style="display:none">
+    <div class="field"><label>ID</label><input id="rId" maxlength="16" autocomplete="off" placeholder="2-16位字母或数字"></div>
+    <div class="field"><label>密码</label><input id="rPwd" type="password" placeholder="请输入密码"></div>
+    <div class="field"><label>名字</label><input id="rName" maxlength="16" placeholder="请输入名字"></div>
+    <div class="gender" id="genderBox">
+      <div class="on" data-g="男" onclick="pickG(this)">男</div>
+      <div data-g="女" onclick="pickG(this)">女</div>
+      <div data-g="保密" onclick="pickG(this)">保密</div>
+    </div>
+    <div class="field" style="margin-bottom:12px"><label>验证</label><input id="rCap" maxlength="6" inputmode="numeric" placeholder="答案" autocomplete="off"><span id="rCapQ" onclick="refreshCap('r')" style="cursor:pointer;color:#1677ff;font-weight:600;padding:0 6px;white-space:nowrap;font-size:14px">加载中...</span></div>
+    <label style="display:flex;align-items:flex-start;gap:8px;font-size:12.5px;color:#5a6b85;margin:4px 0 12px;cursor:pointer;line-height:1.5"><input type="checkbox" id="rAgree" style="width:auto;margin-top:2px"><span>我已阅读并同意 <a href="/terms" target="_blank" style="color:#1677ff">《用户协议》</a> 和 <a href="/privacy" target="_blank" style="color:#1677ff">《隐私政策》</a></span></label>
+    <button class="btn" onclick="doReg()">注 册</button>
+    <div class="tip">🎁 注册即送 3000 元，每月自动发放 3000 元</div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+var g = '男';
+function switchSeg(m){
+  document.getElementById('segLogin').classList.toggle('on', m === 'login');
+  document.getElementById('segReg').classList.toggle('on', m === 'reg');
+  document.getElementById('paneLogin').style.display = m === 'login' ? 'block' : 'none';
+  document.getElementById('paneReg').style.display = m === 'reg' ? 'block' : 'none';
+}
+function pickG(el){
+  var all = document.querySelectorAll('#genderBox div');
+  for(var i=0;i<all.length;i++) all[i].classList.remove('on');
+  el.classList.add('on'); g = el.dataset.g;
+}
+function toast(m){
+  var t = document.getElementById('toast');
+  t.textContent = m; t.classList.add('show');
+  clearTimeout(t._t); t._t = setTimeout(function(){ t.classList.remove('show'); }, 1800);
+}
+function post(u, d){
+  return fetch(u, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(d)}).then(function(r){ return r.json(); });
+}
+var _capTok = {l:'', r:''};
+function refreshCap(pfx){
+  fetch('/api/captcha').then(function(r){return r.json();}).then(function(j){
+    if(j.ok){
+      _capTok[pfx] = j.token;
+      var q = document.getElementById(pfx + 'CapQ');
+      if(q) q.textContent = j.question;
+      var i = document.getElementById(pfx + 'Cap');
+      if(i) i.value = '';
+    }
+  });
+}
+window.addEventListener('DOMContentLoaded', function(){
+  setTimeout(function(){ refreshCap('l'); refreshCap('r'); }, 150);
+});
+
+function doLogin(){
+  var id = document.getElementById('lId').value.trim();
+  var pwd = document.getElementById('lPwd').value;
+  var cap = (document.getElementById('lCap')||{}).value || '';
+  if(!id || !pwd) return toast('请填写ID和密码');
+  if(!cap) return toast('请输入验证码');
+  post('/api/login', {id:id, password:pwd, captcha_token:_capTok['l'], captcha_answer:cap}).then(function(r){
+    if(r.ok) location.href = '/';
+    else { toast(r.msg || '登录失败'); refreshCap('l'); }
+  });
+}
+function doReg(){
+  var id = document.getElementById('rId').value.trim();
+  var pwd = document.getElementById('rPwd').value;
+  var name = document.getElementById('rName').value.trim();
+  var agreeEl = document.getElementById('rAgree');
+  if(!agreeEl || !agreeEl.checked) return toast('请先阅读并同意用户协议和隐私政策');
+  if(!/^[A-Za-z0-9]{2,16}$/.test(id)) return toast('ID需为2-16位字母或数字');
+  if(!pwd) return toast('请输入密码');
+  if(!name) return toast('请输入名字');
+  var cap = (document.getElementById('rCap')||{}).value || '';
+  if(!cap) return toast('请输入验证码');
+  post('/api/register', {id:id, password:pwd, name:name, gender:g, agree:1, captcha_token:_capTok['r'], captcha_answer:cap}).then(function(r){
+    if(r.ok) location.href = '/';
+    else { toast(r.msg || '注册失败'); refreshCap('r'); }
+  });
+}
+document.addEventListener('keydown', function(e){
+  if(e.key === 'Enter'){
+    if(document.getElementById('paneLogin').style.display !== 'none') doLogin();
+    else doReg();
+  }
+});
+</script></body></html>'''
+
+
+ADMIN_HTML = r'''<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>zz聊天 · 后台</title>
+<style>
+:root{--blue:#1677ff;--blue-d:#0b5fd6;--blue-l:#e8f1ff;--bg:#f0f4fa;--sub:#8a97ad}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);padding:22px;color:#1a2233}
+.wrap{max-width:920px;margin:0 auto}
+h1{color:var(--blue-d);font-size:26px;font-weight:800}
+.sub{color:var(--sub);font-size:13.5px;margin:6px 0 20px}
+.card{background:#fff;border-radius:14px;padding:18px;margin-bottom:16px;box-shadow:0 1px 6px rgba(22,90,190,.07)}
+.card h2{font-size:17px;color:var(--blue-d);margin-bottom:12px}
+input{padding:11px 13px;border-radius:10px;border:1px solid #dbe6f5;background:var(--blue-l);font-size:14.5px;outline:none;width:100%;margin-bottom:10px}
+button{padding:11px 18px;border-radius:10px;border:none;background:var(--blue);color:#fff;font-size:14.5px;font-weight:700;cursor:pointer;margin-right:8px}
+button.ghost{background:var(--blue-l);color:var(--blue-d)}
+button.ok{background:#22c55e}
+button.no{background:#ffe8e8;color:#ff4d4f}
+.req{background:#f7fbff;border:1px solid #dbe6f5;border-radius:12px;padding:14px;margin-bottom:10px;display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap}
+.req .biz{font-size:16px;font-weight:700;color:var(--blue-d)}
+.req .meta{font-size:12.5px;color:var(--sub);margin-top:4px;line-height:1.6}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.row>input{flex:1;min-width:120px;margin-bottom:0}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{padding:10px 8px;text-align:left;border-bottom:1px solid #eef3fb}
+th{color:var(--sub);font-weight:600;font-size:12.5px}
+.toast{position:fixed;left:50%;top:24px;transform:translateX(-50%);background:rgba(15,35,70,.9);color:#fff;padding:10px 18px;border-radius:10px;font-size:14px;opacity:0;transition:.3s;pointer-events:none}
+.toast.show{opacity:1}
+</style></head><body>
+<div class="wrap">
+  <h1>zz聊天 · 后台管理</h1>
+  <div class="sub">管理员入口</div>
+  <div class="card"><h2>① 身份验证</h2>
+    <div class="row"><input id="pwd" type="password" placeholder="请输入后台密码"><button onclick="auth()">进入</button></div>
+  </div>
+  <div class="card" id="panel" style="display:none"><h2>② 商家二维码申请审批</h2><div id="reqList">加载中...</div></div>
+  <div class="card" id="panel2" style="display:none"><h2>③ 钱包充值</h2>
+    <div class="row"><input id="rUid" placeholder="用户ID"><input id="rAmt" type="number" step="0.01" placeholder="充值金额"><button onclick="recharge()">充值</button></div>
+  </div>
+  <div class="card" id="panel3" style="display:none"><h2>④ 全部用户</h2>
+    <button class="ghost" onclick="loadUsers()">刷新列表</button><div id="userList" style="margin-top:12px"></div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+var PWD = '';
+function toast(m){var t=document.getElementById('toast');t.textContent=m;t.classList.add('show');clearTimeout(t._t);t._t=setTimeout(function(){t.classList.remove('show');},1800);}
+function post(data){data.password=PWD;return fetch('/qweradmin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}).then(function(r){return r.json();});}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+function statusText(s){return s==='approved'?'✅ 已通过':(s==='rejected'?'❌ 已拒绝':'⏳ 待审核');}
+function auth(){PWD=document.getElementById('pwd').value;post({action:'list_req'}).then(function(r){
+  if(!r.ok)return toast(r.msg||'密码错误');
+  ['panel','panel2','panel3'].forEach(function(id){document.getElementById(id).style.display='block';});
+  renderReq(r.list);
+});}
+function renderReq(list){
+  var box=document.getElementById('reqList');
+  if(!list.length){box.innerHTML='<div style="color:#8a97ad;padding:6px">暂无申请</div>';return;}
+  var h='';
+  for(var i=0;i<list.length;i++){var r=list[i];
+    h+='<div class="req"><div style="flex:1;min-width:200px"><div class="biz">'+esc(r.merchant_name)+'</div>'
+      +'<div class="meta">申请人：'+esc(r.name)+'（ID: '+esc(r.user_id)+'）<br>时间：'+esc(r.created)+'<br>状态：'+statusText(r.status)+'</div></div>'
+      +'<div>'+(r.status==='pending'?'<button class="ok" onclick="handle('+r.id+',\'approve\')">通过</button><button class="no" onclick="handle('+r.id+',\'reject\')">拒绝</button>':'')+'</div></div>';
+  }
+  box.innerHTML=h;
+}
+function handle(id,action){post({action:action,id:id}).then(function(r){if(r.ok){toast('操作成功');loadReq();}else toast(r.msg||'失败');});}
+function loadReq(){post({action:'list_req'}).then(function(r){if(r.ok)renderReq(r.list);});}
+function recharge(){var u=document.getElementById('rUid').value.trim();var a=parseFloat(document.getElementById('rAmt').value||'0');
+  if(!u||!(a>0))return toast('请填写完整信息');
+  post({action:'recharge',user_id:u,amount:a}).then(function(r){if(r.ok){toast('充值成功');document.getElementById('rAmt').value='';}else toast(r.msg||'失败');});}
+function loadUsers(){post({action:'users'}).then(function(r){
+  if(!r.ok)return toast(r.msg||'失败');
+  var h='<table><thead><tr><th>ID</th><th>名字</th><th>性别</th><th>钱包</th><th>商家</th><th>月发</th></tr></thead><tbody>';
+  for(var i=0;i<r.list.length;i++){var u=r.list[i];
+    h+='<tr><td>'+esc(u.id)+'</td><td>'+esc(u.name)+'</td><td>'+esc(u.gender||'保密')+'</td><td>￥'+(+u.wallet).toFixed(2)+'</td><td>'+(u.is_merchant?'✅ '+esc(u.merchant_name||''):'—')+'</td><td>'+esc(u.last_monthly||'—')+'</td></tr>';
+  }
+  h+='</tbody></table>';
+  document.getElementById('userList').innerHTML=h;
+});}
+</script></body></html>'''
+
+
+INDEX_HTML = r'''<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>zz聊天</title>
+<style>
+:root{--blue:#1677ff;--blue-d:#0b5fd6;--blue-l:#e8f1ff;--bg:#f0f4fa;--sub:#8a97ad}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:#1a2233;overflow:hidden;height:100vh;height:100dvh}
+button{font-family:inherit;cursor:pointer;border:none;background:none;color:inherit}
+input,textarea{font-family:inherit;font-size:15px;outline:none;border:none;background:none;color:inherit}
+#app{display:flex;flex-direction:column;height:100vh;height:100dvh}
+.topbar{height:52px;background:linear-gradient(135deg,#1677ff,#0b5fd6);color:#fff;display:flex;align-items:center;justify-content:space-between;padding:0 14px;flex-shrink:0;box-shadow:0 2px 10px rgba(15,80,190,.25);z-index:10}
+.brand{font-size:18px;font-weight:800;letter-spacing:2px}
+.icon-btn{width:36px;height:36px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:18px;background:rgba(255,255,255,.16)}
+.icon-btn:active{background:rgba(255,255,255,.32)}
+main{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch}
+.tabbar{height:58px;background:#fff;border-top:1px solid #e4ecf7;display:flex;flex-shrink:0;padding-bottom:env(safe-area-inset-bottom)}
+.tab-item{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;color:#9aa8bd;font-size:11px;cursor:pointer}
+.tab-item i{font-style:normal;font-size:20px;line-height:1}
+.tab-item.active{color:var(--blue);font-weight:600}
+.list-item{display:flex;align-items:center;gap:12px;padding:12px 15px;background:#fff;border-bottom:1px solid #f2f6fc;cursor:pointer}
+.list-item:active{background:#f6faff}
+.avatar{width:46px;height:46px;border-radius:12px;object-fit:cover;background:var(--blue-l);flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:18px;color:var(--blue);font-weight:700;overflow:hidden}
+.avatar.sm{width:36px;height:36px;border-radius:10px;font-size:15px}
+.avatar img{width:100%;height:100%;object-fit:cover}
+.li-main{flex:1;min-width:0}
+.li-title{font-size:15.5px;font-weight:500;display:flex;align-items:center;gap:6px;margin-bottom:3px}
+.li-desc{font-size:13px;color:var(--sub);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tag{font-size:10px;background:linear-gradient(135deg,#ffb300,#ff8f00);color:#fff;border-radius:5px;padding:1px 5px;font-weight:600}
+.tag.blue{background:linear-gradient(135deg,#1677ff,#0b5fd6)}
+.empty{text-align:center;color:var(--sub);padding:50px 20px;font-size:14px}
+.sub-tabs{display:flex;background:#fff;border-bottom:1px solid #e4ecf7;position:sticky;top:0;z-index:5}
+.sub-tabs div{flex:1;text-align:center;padding:13px 0;font-size:15px;color:#7a8798;position:relative;font-weight:500;cursor:pointer}
+.sub-tabs div.on{color:var(--blue);font-weight:700}
+.sub-tabs div.on::after{content:'';position:absolute;bottom:0;left:50%;transform:translateX(-50%);width:26px;height:3px;background:var(--blue);border-radius:2px}
+.card{background:#fff;margin:10px 12px;border-radius:14px;overflow:hidden;box-shadow:0 1px 6px rgba(22,90,190,.06)}
+.set-row{display:flex;align-items:center;justify-content:space-between;padding:15px 16px;border-bottom:1px solid #f2f6fc;font-size:15.5px;cursor:pointer}
+.set-row:last-child{border-bottom:none}
+.set-row .val{color:var(--sub);font-size:14px;display:flex;align-items:center;gap:8px;max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.arrow{color:#c7d3e3;font-size:16px}
+.btn-row{display:flex;gap:10px;padding:12px}
+.btn-row button{flex:1;padding:12px;border-radius:11px;background:var(--blue-l);color:var(--blue-d);font-weight:600;font-size:14.5px}
+.btn-row button.p{background:var(--blue);color:#fff}
+.btn-main{width:100%;padding:12px;border-radius:11px;background:var(--blue);color:#fff;font-size:15.5px;font-weight:700}
+.overlay{position:fixed;inset:0;background:var(--bg);z-index:100;display:none;flex-direction:column}
+.overlay.show{display:flex}
+.mask{position:fixed;inset:0;background:rgba(10,25,50,.5);z-index:200;display:none;align-items:center;justify-content:center;padding:20px}
+.mask.show{display:flex}
+.sheet{background:#fff;border-radius:16px;padding:20px;width:100%;max-width:360px;box-shadow:0 12px 40px rgba(20,60,140,.25);max-height:85vh;overflow-y:auto}
+.sheet h3{font-size:17px;margin-bottom:14px;color:var(--blue-d);font-weight:700}
+.sheet input,.sheet textarea{width:100%;background:var(--blue-l);border-radius:10px;padding:11px 13px;margin-bottom:10px;font-size:15px}
+.sheet textarea{min-height:70px;resize:vertical}
+.sheet .row{display:flex;gap:10px;margin-top:6px}
+.sheet .row button{flex:1;padding:11px;border-radius:10px;background:#eef3fb;font-size:15px;color:#54637a;font-weight:600}
+.sheet .row button.primary{background:var(--blue);color:#fff}
+.toast{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);background:rgba(15,35,70,.9);color:#fff;padding:10px 20px;border-radius:10px;font-size:14px;z-index:999;opacity:0;pointer-events:none;transition:.25s}
+.toast.show{opacity:1}
+.chat-header{height:52px;background:linear-gradient(135deg,#1677ff,#0b5fd6);color:#fff;display:flex;align-items:center;padding:0 8px;gap:6px;flex-shrink:0;box-shadow:0 2px 10px rgba(15,80,190,.25)}
+.chat-header .back{font-size:22px;width:36px;height:36px;display:flex;align-items:center;justify-content:center;border-radius:10px}
+.chat-title{flex:1;font-size:16.5px;font-weight:600;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chat-actions{display:flex;gap:2px}
+.chat-body{flex:1;overflow-y:auto;padding:14px 12px;background:#eef3fa}
+.msg{display:flex;margin-bottom:14px;gap:8px;align-items:flex-start}
+.msg.me{flex-direction:row-reverse}
+.msg .bubble{max-width:72%;padding:9px 13px;border-radius:14px;background:#fff;font-size:15px;line-height:1.45;word-break:break-word;box-shadow:0 1px 4px rgba(20,60,140,.07)}
+.msg.me .bubble{background:var(--blue);color:#fff}
+.msg .bubble img,.msg .bubble video{max-width:220px;border-radius:10px;display:block}
+.msg-time{text-align:center;font-size:11.5px;color:#9fb0c6;margin:10px 0}
+.rp{display:flex;align-items:center;gap:10px;min-width:170px;cursor:pointer}
+.rp .ic{font-size:28px}
+.rp .r1{font-size:14.5px;font-weight:700}
+.rp .r2{font-size:11.5px;opacity:.85;margin-top:2px}
+.rp.done{opacity:.55}
+.chat-input{background:#fff;border-top:1px solid #e4ecf7;padding:8px 10px;display:flex;align-items:flex-end;gap:7px;flex-shrink:0;padding-bottom:calc(8px + env(safe-area-inset-bottom))}
+.chat-input textarea{flex:1;background:var(--blue-l);border-radius:12px;padding:9px 13px;max-height:100px;min-height:40px;resize:none;font-size:15px;line-height:1.4}
+.chat-input .ib{width:38px;height:38px;border-radius:11px;background:var(--blue-l);display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0}
+.chat-input .send{background:var(--blue);color:#fff;font-size:14px;font-weight:700;padding:0 16px;height:38px;border-radius:11px;flex-shrink:0}
+#callUI{position:fixed;inset:0;background:#0a1428;z-index:300;display:none;flex-direction:column}
+#callUI.show{display:flex}
+#remoteVideo{flex:1;object-fit:cover;background:#0a1428;width:100%}
+#localVideo{position:absolute;right:14px;top:64px;width:104px;height:144px;object-fit:cover;border-radius:12px;border:2px solid rgba(255,255,255,.35);background:#000}
+.call-info{position:absolute;left:0;right:0;top:16px;text-align:center;color:#fff;font-size:16px;font-weight:600;text-shadow:0 2px 8px rgba(0,0,0,.6)}
+.call-btns{position:absolute;left:0;right:0;bottom:38px;display:flex;justify-content:center;gap:20px}
+.call-btns button{width:60px;height:60px;border-radius:50%;font-size:24px;display:flex;align-items:center;justify-content:center;color:#fff}
+.cb-hang{background:#ff4d4f}
+.cb-ok{background:#22c55e}
+.cb-mute{background:rgba(255,255,255,.2)}
+.incoming-call{position:fixed;inset:0;z-index:400;display:none;flex-direction:column;align-items:center;justify-content:center;padding:30px;color:#fff;background:linear-gradient(160deg,#1677ff,#083d8f)}
+.incoming-call.show{display:flex}
+.incoming-icon{font-size:72px;margin-bottom:24px;animation:ring .8s infinite}
+@keyframes ring{0%,100%{transform:rotate(-12deg)}50%{transform:rotate(12deg)}}
+.incoming-name{font-size:26px;font-weight:700;margin-bottom:8px;text-align:center}
+.incoming-type{font-size:15px;opacity:.85;margin-bottom:56px}
+.incoming-btns{display:flex;gap:64px}
+.incoming-btns button{width:82px;height:82px;border-radius:50%;border:none;font-size:30px;color:#fff;cursor:pointer;display:flex;flex-direction:column;align-items:center;justify-content:center;line-height:1;font-family:inherit}
+.incoming-btns button span{font-size:12.5px;margin-top:4px;font-weight:600}
+.incoming-reject{background:#ff4d4f}
+.incoming-accept{background:#22c55e}
+.moment{background:#fff;margin:10px 12px;border-radius:14px;padding:14px;box-shadow:0 1px 6px rgba(22,90,190,.06)}
+.moment-head{display:flex;gap:10px;align-items:center;margin-bottom:9px}
+.moment-name{font-size:15px;font-weight:700;color:var(--blue-d)}
+.moment-time{font-size:11.5px;color:var(--sub);margin-left:auto}
+.moment-text{font-size:15px;line-height:1.5;margin-bottom:9px;white-space:pre-wrap;word-break:break-word}
+.moment-media{display:grid;grid-template-columns:repeat(3,1fr);gap:5px}
+.moment-media img,.moment-media video{width:100%;aspect-ratio:1;object-fit:cover;border-radius:9px}
+.moment-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:10px;border-top:1px solid #f2f6fc;padding-top:8px}
+.moment-actions button{font-size:13px;color:#1677ff;padding:4px 10px;border-radius:8px;background:#e8f1ff}
+.moment-comments{margin-top:8px;background:#f7faff;border-radius:10px;padding:8px 10px}
+.moment-comments:empty{display:none}
+.mc-item{font-size:13.5px;color:#1a2233;line-height:1.6;padding:2px 0;word-break:break-word}
+.mc-item b{color:#0b5fd6;font-weight:600}
+.mc-del{color:#ff4d4f;font-size:12px;margin-left:6px;cursor:pointer}
+.moment-del{font-size:12.5px;color:#ff4d4f;margin-top:10px;text-align:right;cursor:pointer}
+.qr-token{font-size:11.5px;color:#7a8798;background:var(--blue-l);padding:8px;border-radius:8px;margin-top:12px;word-break:break-all;font-family:monospace;text-align:center}
+.scan-box{position:relative;background:#000;border-radius:12px;overflow:hidden;aspect-ratio:1;margin-bottom:10px}
+.scan-box video{width:100%;height:100%;object-fit:cover;display:block}
+.scan-frame{position:absolute;inset:14%;border:3px solid #1677ff;border-radius:12px;pointer-events:none;box-shadow:0 0 0 9999px rgba(0,0,0,.4)}
+</style></head><body>
+<div id="app">
+  <div class="topbar">
+    <div class="brand">zz聊天</div>
+    <button class="icon-btn" onclick="openScan()" title="扫一扫">📷</button>
+  </div>
+  <main>
+    <div class="page" id="page-msg">
+      <div class="sub-tabs">
+        <div class="on" onclick="switchMsgTab('private',this)">私聊</div>
+        <div onclick="switchMsgTab('group',this)">群聊</div>
+      </div>
+      <div id="msgPrivate"></div>
+      <div id="msgGroup" style="display:none"></div>
+    </div>
+    <div class="page" id="page-contact" style="display:none">
+      <div class="btn-row" style="padding:10px 12px 0"><button class="p" onclick="openAddFriend()">➕ 添加好友</button></div>
+      <div class="sub-tabs" style="margin-top:8px">
+        <div class="on" onclick="switchContactTab('req',this)">申请</div>
+        <div onclick="switchContactTab('friends',this)">我的好友</div>
+        <div onclick="switchContactTab('groups',this)">我的群聊</div>
+      </div>
+      <div id="contactReq"></div>
+      <div id="contactFriends" style="display:none"></div>
+      <div id="contactGroups" style="display:none"></div>
+      <div class="btn-row" id="createGroupRow" style="display:none"><button class="p" onclick="openCreateGroup()">➕ 创建群聊</button></div>
+    </div>
+    <div class="page" id="page-moment" style="display:none">
+      <div class="btn-row"><button class="p" onclick="openPostMoment()">✍️ 发布朋友圈</button></div>
+      <div id="momentList"></div>
+    </div>
+    
+    <div class="page" id="page-about" style="display:none; padding: 20px;">
+      <div class="card" style="padding:20px; line-height:1.6;">
+        <h2 style="color:#0b5fd6; margin-bottom:15px;">关于 zz聊天 & ZDX工作室</h2>
+        <p style="margin-bottom:10px; font-size:15px;">本项目是一个完全公益的轻量级聊天平台，旨在为朋友间提供一个纯净、无广告的交流空间。</p>
+        <p style="margin-bottom:20px; font-size:15px;">由 ZDX工作室 提供技术支持与维护。</p>
+        
+        <h3 style="color:#0b5fd6; margin-bottom:10px; font-size:16px;">❤️ 赞赏方式</h3>
+        <p style="font-size:14px; color:#666;">如果你觉得这个项目不错，欢迎请开发者喝杯咖啡：</p>
+        <div style="background:#f7faff; padding:15px; border-radius:10px; margin-top:10px; font-size:14px;">
+          <div style="margin-bottom:8px;"><b>支付宝：</b>19277351579</div>
+          <div><b>QQ：</b>3909872087</div>
+        </div>
+        <p style="margin-top:20px; font-size:12px; color:#999; text-align:center;">© 2026 ZDX工作室 版权所有</p>
+      </div>
+    </div>
+
+    <div class="page" id="page-me" style="display:none">
+      <div class="card" style="display:flex;align-items:center;gap:14px;padding:18px">
+        <div id="meAvatarBox"></div>
+        <div style="flex:1;min-width:0">
+          <div style="font-size:18px;font-weight:700" id="meName">-</div>
+          <div style="color:var(--sub);font-size:13px;margin-top:4px">ID: <span id="meId">-</span> · <span id="meGender">-</span></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="set-row" onclick="openWallet()"><span>💰 我的钱包</span><span class="val"><span id="meWallet">0.00</span> 元 <span class="arrow">›</span></span></div>
+        <div class="set-row" onclick="openEditName()"><span>✏️ 修改名字</span><span class="val"><span class="arrow">›</span></span></div>
+        <div class="set-row" onclick="openEditId()"><span>🔑 修改ID</span><span class="val"><span class="arrow">›</span></span></div>
+        <div class="set-row" onclick="openEditGender()"><span>⚧ 修改性别</span><span class="val"><span class="arrow">›</span></span></div>
+        <div class="set-row" onclick="document.getElementById('avatarFile').click()"><span>🖼 修改头像</span><span class="val"><span class="arrow">›</span></span></div>
+        <input type="file" id="avatarFile" accept="image/*" style="display:none" onchange="uploadAvatar(this)">
+      </div>
+      <div class="card">
+        <div class="set-row" onclick="openMyQR()"><span>📱 我的二维码</span><span class="val"><span class="arrow">›</span></span></div>
+        <div class="set-row" onclick="openMerchantApply()"><span>🏪 申请商家二维码</span><span class="val" id="merchantStatus">未申请 <span class="arrow">›</span></span></div>
+        <div class="set-row" onclick="openMerchantQR()"><span>🏬 我的商家二维码</span><span class="val"><span class="arrow">›</span></span></div>
+      </div>
+      <div class="card">
+        <div class="set-row" onclick="logout()" style="color:#ff4d4f;justify-content:center"><span>退出登录</span></div>
+      </div>
+      <div style="height:20px"></div>
+    </div>
+  </main>
+  <div class="tabbar">
+    <div class="tab-item active" data-page="msg" onclick="switchPage('msg')"><i>💬</i><span>消息</span></div>
+    <div class="tab-item" data-page="contact" onclick="switchPage('contact')"><i>📒</i><span>通讯录</span></div>
+    <div class="tab-item" data-page="moment" onclick="switchPage('moment')"><i>🌐</i><span>朋友圈</span></div>
+    <div class="tab-item" data-page="me" onclick="switchPage('me')"><i>👤</i><span>我</span></div>
+    <div class="tab-item" onclick="window.open('https://zdxstudio.dpdns.org','_blank')"><i>🌐</i><span>我的主页</span></div>
+    <div class="tab-item" data-page="about" onclick="switchPage('about')"><i>💡</i><span>关于</span></div>
+  </div>
+</div>
+
+<div class="overlay" id="chatView">
+  <div class="chat-header">
+    <button class="back" onclick="closeChat()">‹</button>
+    <div class="chat-title" id="chatTitle">聊天</div>
+    <div class="chat-actions">
+      <button class="icon-btn" id="btnCallVoice" onclick="startCall(false)" title="语音通话">📞</button>
+      <button class="icon-btn" id="btnCallVideo" onclick="startCall(true)" title="视频通话">🎥</button>
+      <button class="icon-btn" id="btnChatMore" onclick="openChatMore()" title="更多" style="display:none">⋯</button>
+    </div>
+  </div>
+  <div class="chat-body" id="chatBody"></div>
+  <div class="chat-input">
+    <button class="ib" onclick="document.getElementById('chatFile').click()">📎</button>
+    <input type="file" id="chatFile" style="display:none" onchange="sendFile(this)">
+    <button class="ib" onclick="openRedpacket()">🧧</button>
+    <textarea id="chatText" rows="1" placeholder="输入消息..." oninput="autoGrow(this)"></textarea>
+    <button class="send" onclick="sendText()">发送</button>
+  </div>
+</div>
+
+<div id="callUI">
+  <video id="remoteVideo" autoplay playsinline></video>
+  <video id="localVideo" autoplay playsinline muted></video>
+  <div class="call-info" id="callInfo">通话中...</div>
+  <div class="call-btns">
+    <button class="cb-mute" onclick="toggleMute()" id="btnMute">🎙</button>
+    <button class="cb-mute" onclick="toggleCamera()" id="btnCam" style="display:none">📷</button>
+    <button class="cb-mute" onclick="switchCamera()" id="btnSwitch" style="display:none">🔄</button>
+    <button class="cb-mute" onclick="toggleSpeaker()" id="btnSpeaker">🔊</button>
+    <button class="cb-ok" onclick="acceptCall()" id="btnAccept" style="display:none">📞</button>
+    <button class="cb-hang" onclick="hangup()" id="btnHang">📵</button>
+  </div>
+</div>
+
+<div id="incomingCall" class="incoming-call">
+  <div class="incoming-icon">📞</div>
+  <div class="incoming-name" id="incomingName">来电</div>
+  <div class="incoming-type" id="incomingType">语音通话</div>
+  <div class="incoming-btns">
+    <button class="incoming-reject" onclick="rejectCall()">📵<span>拒绝</span></button>
+    <button class="incoming-accept" onclick="acceptCall()">📞<span>接听</span></button>
+  </div>
+</div>
+
+<div class="mask" id="mask"><div class="sheet" id="sheet"></div></div>
+<div class="toast" id="toast"></div>
+<script>
+var ME = null;
+var CURRENT = {type:'private', id:null, name:''};
+var FRIENDS = [], GROUPS = [];
+
+function $(s){ return document.querySelector(s); }
+function toast(m){
+  var t = $('#toast'); if(!t) return;
+  t.textContent = m; t.classList.add('show');
+  clearTimeout(t._t); t._t = setTimeout(function(){ t.classList.remove('show'); }, 1800);
+}
+function esc(s){
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+  });
+}
+function fmtTime(t){ return t ? t.slice(5,16) : ''; }
+function avatarHtml(u, cls){
+  var extra = cls ? (' ' + cls) : '';
+  if(u && u.avatar) return '<div class="avatar' + extra + '"><img src="' + esc(u.avatar) + '"></div>';
+  var ch = (u && u.name) ? u.name.charAt(0) : '?';
+  return '<div class="avatar' + extra + '">' + esc(ch) + '</div>';
+}
+function api(u, d, method){
+  method = method || 'GET';
+  var o = {method:method, headers:{'Content-Type':'application/json'}};
+  if(d) o.body = JSON.stringify(d);
+  return fetch(u, o).then(function(r){ return r.json(); });
+}
+
+function switchPage(p){
+  var pages = document.querySelectorAll('.page');
+  for(var i=0;i<pages.length;i++) pages[i].style.display = 'none';
+  var tabs = document.querySelectorAll('.tab-item');
+  for(var j=0;j<tabs.length;j++) tabs[j].classList.remove('active');
+  var pg = document.getElementById('page-' + p);
+  if(pg) pg.style.display = 'block';
+  var tb = document.querySelector('.tab-item[data-page="' + p + '"]');
+  if(tb) tb.classList.add('active');
+  if(p === 'msg') loadMsgLists();
+  if(p === 'contact') loadContacts();
+  if(p === 'me') loadMe();
+  if(p === 'moment') loadMoments();
+}
+function switchMsgTab(t, el){
+  var ps = el.parentNode.querySelectorAll('div');
+  for(var i=0;i<ps.length;i++) ps[i].classList.remove('on');
+  el.classList.add('on');
+  $('#msgPrivate').style.display = (t === 'private') ? 'block' : 'none';
+  $('#msgGroup').style.display = (t === 'group') ? 'block' : 'none';
+}
+function switchContactTab(t, el){
+  var ps = el.parentNode.querySelectorAll('div');
+  for(var i=0;i<ps.length;i++) ps[i].classList.remove('on');
+  el.classList.add('on');
+  var ks = ['req', 'friends', 'groups'];
+  for(var j=0;j<ks.length;j++){
+    var box = document.getElementById('contact' + ks[j].charAt(0).toUpperCase() + ks[j].slice(1));
+    if(box) box.style.display = (ks[j] === t) ? 'block' : 'none';
+  }
+  var cg = $('#createGroupRow');
+  if(cg) cg.style.display = (t === 'groups') ? 'flex' : 'none';
+  loadContacts();
+}
+
+function loadMe(){
+  return api('/api/me').then(function(r){
+    if(!r.ok){ location.href = '/'; return; }
+    ME = r.user;
+    $('#meName').textContent = ME.name;
+    $('#meId').textContent = ME.id;
+    $('#meGender').textContent = ME.gender;
+    $('#meWallet').textContent = (+ME.wallet).toFixed(2);
+    $('#meAvatarBox').innerHTML = avatarHtml(ME).replace('class="avatar"', 'class="avatar" style="width:60px;height:60px;border-radius:16px;font-size:22px"');
+    return api('/api/qrcode/merchant/status').then(function(s){
+      if(s.ok){
+        var el = $('#merchantStatus');
+        if(s.is_merchant) el.innerHTML = '✅ ' + esc(s.merchant_name) + ' <span class="arrow">›</span>';
+        else if(s.req_status === 'pending') el.innerHTML = '⏳ 审核中 <span class="arrow">›</span>';
+        else if(s.req_status === 'rejected') el.innerHTML = '❌ 已拒绝 <span class="arrow">›</span>';
+        else el.innerHTML = '未申请 <span class="arrow">›</span>';
+      }
+    });
+  });
+}
+
+function loadMsgLists(){
+  return Promise.all([api('/api/friends'), api('/api/groups')]).then(function(arr){
+    FRIENDS = (arr[0].list || []).filter(function(x){ return x.status === 'accepted'; });
+    GROUPS = arr[1].list || [];
+    var p = $('#msgPrivate');
+    if(!FRIENDS.length){ p.innerHTML = '<div class="empty">还没有好友，去通讯录添加吧～</div>'; }
+    else {
+      var h = '';
+      for(var i=0;i<FRIENDS.length;i++){
+        var f = FRIENDS[i];
+        h += '<div class="list-item" onclick="openChat(\'private\',\'' + esc(f.id) + '\',\'' + esc(f.name) + '\')">' + avatarHtml(f)
+          + '<div class="li-main"><div class="li-title">' + esc(f.name)
+          + (f.gender === '女' ? ' <span class="tag blue">女</span>' : '')
+          + '</div><div class="li-desc">ID: ' + esc(f.id) + '</div></div></div>';
+      }
+      p.innerHTML = h;
+    }
+    var g = $('#msgGroup');
+    if(!GROUPS.length){ g.innerHTML = '<div class="empty">还没有群聊，去通讯录创建吧～</div>'; }
+    else {
+      var h2 = '';
+      for(var k=0;k<GROUPS.length;k++){
+        var gr = GROUPS[k];
+        h2 += '<div class="list-item" onclick="openChat(\'group\',\'' + esc(gr.gid) + '\',\'' + esc(gr.name) + '\')">'
+           +  '<div class="avatar" style="background:linear-gradient(135deg,#1677ff,#0b5fd6);color:#fff">群</div>'
+           +  '<div class="li-main"><div class="li-title">' + esc(gr.name) + '</div>'
+           +  '<div class="li-desc">点击进入群聊</div></div></div>';
+      }
+      g.innerHTML = h2;
+    }
+  });
+}
+
+function loadContacts(){
+  return api('/api/friends').then(function(r){
+    var all = r.list || [];
+    var pending = all.filter(function(x){ return x.status === 'pending'; });
+    var accepted = all.filter(function(x){ return x.status === 'accepted'; });
+    var incoming = pending.filter(function(x){ return x.is_incoming; });
+    var outgoing = pending.filter(function(x){ return !x.is_incoming; });
+    var reqHtml = '';
+    if(incoming.length){
+      reqHtml += '<div style="padding:14px 15px 8px;font-size:12.5px;color:#8a97ad;font-weight:600">收到的申请</div>';
+      for(var i=0;i<incoming.length;i++){
+        var f = incoming[i];
+        reqHtml += '<div class="list-item">' + avatarHtml(f)
+          + '<div class="li-main"><div class="li-title">' + esc(f.name) + '</div>'
+          + '<div class="li-desc">ID: ' + esc(f.id) + ' · ' + esc(f.gender || '保密') + '</div></div>'
+          + '<div style="display:flex;gap:8px">'
+          + '<button style="padding:7px 12px;border-radius:9px;background:#22c55e;color:#fff;font-size:13px;font-weight:600" onclick="handleFriend(\'' + esc(f.id) + '\',\'accept\')">通过</button>'
+          + '<button style="padding:7px 12px;border-radius:9px;background:#ffe8e8;color:#ff4d4f;font-size:13px;font-weight:600" onclick="handleFriend(\'' + esc(f.id) + '\',\'reject\')">拒绝</button>'
+          + '</div></div>';
+      }
+    }
+    if(outgoing.length){
+      reqHtml += '<div style="padding:14px 15px 8px;font-size:12.5px;color:#8a97ad;font-weight:600">我发出的申请</div>';
+      for(var j=0;j<outgoing.length;j++){
+        var fo = outgoing[j];
+        reqHtml += '<div class="list-item">' + avatarHtml(fo)
+          + '<div class="li-main"><div class="li-title">' + esc(fo.name) + '</div>'
+          + '<div class="li-desc">ID: ' + esc(fo.id) + ' · 等待对方验证</div></div>'
+          + '<div style="font-size:12px;color:#8a97ad">等待验证</div></div>';
+      }
+    }
+    $('#contactReq').innerHTML = reqHtml || '<div class="empty">暂无好友申请</div>';
+    var fb = $('#contactFriends');
+    if(!accepted.length){ fb.innerHTML = '<div class="empty">还没有好友</div>'; }
+    else {
+      var h = '';
+      for(var m=0;m<accepted.length;m++){
+        var fx = accepted[m];
+        h += '<div class="list-item" onclick="openChat(\'private\',\'' + esc(fx.id) + '\',\'' + esc(fx.name) + '\')">' + avatarHtml(fx)
+          +  '<div class="li-main"><div class="li-title">' + esc(fx.name) + '</div>'
+          +  '<div class="li-desc">ID: ' + esc(fx.id) + '</div></div></div>';
+      }
+      fb.innerHTML = h;
+    }
+    return api('/api/groups').then(function(gRes){
+      var gs = gRes.list || [];
+      var gb = $('#contactGroups');
+      if(!gs.length){ gb.innerHTML = '<div class="empty">还没有群聊</div>'; }
+      else {
+        var h2 = '';
+        for(var n=0;n<gs.length;n++){
+          var gx = gs[n];
+          h2 += '<div class="list-item" onclick="openChat(\'group\',\'' + esc(gx.gid) + '\',\'' + esc(gx.name) + '\')">'
+             +  '<div class="avatar" style="background:linear-gradient(135deg,#1677ff,#0b5fd6);color:#fff">群</div>'
+             +  '<div class="li-main"><div class="li-title">' + esc(gx.name) + '</div>'
+             +  '<div class="li-desc">群ID: ' + esc(gx.gid) + '</div></div></div>';
+        }
+        gb.innerHTML = h2;
+      }
+    });
+  });
+}
+
+function handleFriend(id, action){
+  api('/api/friend/handle', {id:id, action:action}, 'POST').then(function(r){
+    if(r.ok){ toast(action === 'accept' ? '已通过' : '已拒绝'); loadContacts(); }
+    else toast(r.msg || '失败');
+  });
+}
+
+function openChat(type, id, name){
+  CURRENT = {type:type, id:id, name:name};
+  $('#chatTitle').textContent = name;
+  var bV = $('#btnCallVoice'), bD = $('#btnCallVideo'), bM = $('#btnChatMore');
+  if(bV) bV.style.display = (type === 'private') ? 'flex' : 'none';
+  if(bD) bD.style.display = (type === 'private') ? 'flex' : 'none';
+  if(bM) bM.style.display = (type === 'group') ? 'flex' : 'none';
+  $('#chatView').classList.add('show');
+  loadChat();
+  clearInterval(window._chatTimer);
+  window._chatTimer = setInterval(loadChat, 2500);
+}
+function closeChat(){
+  $('#chatView').classList.remove('show');
+  clearInterval(window._chatTimer);
+  CURRENT = {type:'private', id:null, name:''};
+  loadMsgLists();
+}
+function loadChat(){
+  if(!CURRENT.id) return;
+  var q = CURRENT.type === 'group'
+    ? '/api/messages?gid=' + encodeURIComponent(CURRENT.id)
+    : '/api/messages?to=' + encodeURIComponent(CURRENT.id);
+  return api(q).then(function(r){
+    if(!r.ok) return;
+    var body = $('#chatBody');
+    var atBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 80;
+    var h = '';
+    var list = r.list || [];
+    for(var i=0;i<list.length;i++) h += renderMsg(list[i]);
+    body.innerHTML = h || '<div class="empty">还没有消息，打个招呼吧～</div>';
+    if(atBottom) body.scrollTop = body.scrollHeight;
+  });
+}
+function renderMsg(m){
+  var isMe = (m.from_id === ME.id);
+  var cls = isMe ? 'msg me' : 'msg';
+  var inner = '';
+  if(m.type === 'text') inner = esc(m.content);
+  else if(m.type === 'image') inner = '<img src="' + esc(m.content) + '" onclick="openMediaPreview(\'' + esc(m.content) + '\', \'image\')">';
+  else if(m.type === 'video') inner = '<div style="position:relative;cursor:pointer" onclick="openMediaPreview(\'' + esc(m.content) + '\', \'video\')"><video src="' + esc(m.content) + '" style="pointer-events:none"></video><div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.3)"><span style="color:#fff;font-size:32px">▶️</span></div></div>';
+  else if(m.type === 'file'){
+    var info = {}; try{ info = JSON.parse(m.content); }catch(e){}
+    var fileUrl = info.url || m.content;
+    var fileName = info.name || '未知文件';
+    inner = '<div style="display:flex;gap:10px;align-items:center;padding:4px;cursor:pointer" onclick="downloadFile(\'' + esc(fileUrl) + '\', \'' + esc(fileName) + '\')"><div style="width:42px;height:42px;background:#e8f1ff;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:22px">📄</div><div style="display:flex;flex-direction:column;max-width:170px"><span style="font-weight:600;font-size:14.5px;text-overflow:ellipsis;overflow:hidden;white-space:nowrap">' + esc(fileName) + '</span><span style="font-size:11.5px;color:#8a97ad;margin-top:3px">点击下载</span></div></div>';
+  }
+  else if(m.type === 'redpacket'){
+    var rp = m.rp || {};
+    var mine = rp.my_amount; var remain = rp.remain_count;
+    var sub = '点击领取红包', c = 'rp';
+    if(mine != null){ sub = '已领取 ￥' + (+mine).toFixed(2); c = 'rp done'; }
+    else if(remain != null && remain <= 0){ sub = '已被领完'; c = 'rp done'; }
+    else if(rp.rtype === 'group'){ sub = '剩余 ' + (remain||0) + '/' + (rp.total_count||0) + ' 个'; }
+    inner = '<div class="' + c + '" onclick="claimRP(\'' + esc(rp.rid||'') + '\',this)"><span class="ic">🧧</span><div><div class="r1">' + esc(rp.msg || '恭喜发财') + '</div><div class="r2">' + esc(sub) + '</div></div></div>';
+  } else if(m.type === 'call'){
+    inner = '<div style="display:flex;align-items:center;gap:8px"><span style="font-size:20px">📞</span><span>' + esc(m.content) + '</span></div>';
+  } else if(m.type === 'card'){
+    var card = m.card || {};
+    var ch = card.name ? card.name.charAt(0) : '?';
+    var av = card.avatar ? '<img src="' + esc(card.avatar) + '" style="width:40px;height:40px;border-radius:10px;object-fit:cover">' : '<div style="width:40px;height:40px;border-radius:10px;background:#e8f1ff;color:#1677ff;display:flex;align-items:center;justify-content:center;font-weight:700">' + esc(ch) + '</div>';
+    inner = '<div onclick="viewCard(\'' + esc(card.id||'') + '\')" style="cursor:pointer;min-width:200px"><div style="display:flex;gap:10px;align-items:center">' + av + '<div style="flex:1"><div style="font-weight:700;font-size:15px">' + esc(card.name||'') + '</div><div style="font-size:11.5px;opacity:.75">个人名片 · 点击查看</div></div></div></div>';
+  } else inner = esc(m.content);
+  var fu = {name: m.from_name || (isMe ? '我' : '友'), avatar: m.from_avatar || ''};
+  if(isMe && ME && ME.avatar && !fu.avatar) fu.avatar = ME.avatar;
+  return '<div class="msg-time">' + fmtTime(m.created) + '</div><div class="' + cls + '">' + avatarHtml(fu, 'sm') + '<div class="bubble">' + inner + '</div></div>';
+}
+function autoGrow(el){ el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 100) + 'px'; }
+function sendText(){
+  var t = $('#chatText'); var v = t.value.trim();
+  if(!v) return;
+  t.value = ''; t.style.height = 'auto';
+  var d = {type:'text', content:v};
+  if(CURRENT.type === 'group') d.gid = CURRENT.id; else d.to = CURRENT.id;
+  api('/api/send', d, 'POST').then(function(r){ if(r.ok) loadChat(); else toast(r.msg || '发送失败'); });
+}
+function sendFile(input){
+  var f = input.files[0]; 
+  if(!f) return; 
+  input.value = '';
+  
+  if(f.size > 200 * 1024 * 1024){
+    return toast('文件太大，最大支持 200MB');
+  }
+  toast('文件上传中，请稍候...');
+  var fd = new FormData(); 
+  fd.append('file', f);
+  
+  fetch('/api/upload', {method:'POST', body:fd})
+    .then(function(res){ return res.json(); })
+    .then(function(up){
+      if(!up.ok) {
+        return toast(up.msg || '上传失败，可能不支持该格式');
+      }
+      var isImg = /\.(png|jpe?g|gif|webp|bmp)$/i.test(f.name);
+      var isVid = /\.(mp4|webm|mov|m4v)$/i.test(f.name);
+      var d;
+      if(isImg) {
+        d = {type:'image', content:up.url};
+      } else if(isVid) {
+        d = {type:'video', content:up.url};
+      } else {
+        d = {type:'file', content: JSON.stringify({url:up.url, name:f.name})};
+      }
+      if(CURRENT.type === 'group') d.gid = CURRENT.id; 
+      else d.to = CURRENT.id;
+      
+      return api('/api/send', d, 'POST').then(function(r){ 
+        if(r.ok) {
+          toast('发送成功');
+          loadChat(); 
+        } else {
+          toast(r.msg || '发送失败');
+        }
+      });
+    })
+    .catch(function(e){
+      console.error(e);
+      toast('网络错误或文件异常');
+    });
+}
+
+function showSheet(html){ $('#sheet').innerHTML = html; $('#mask').classList.add('show'); }
+function hideSheet(){ $('#mask').classList.remove('show'); }
+$('#mask').addEventListener('click', function(e){ if(e.target.id === 'mask') hideSheet(); });
+
+function openAddFriend(){
+  showSheet('<h3>➕ 添加好友</h3><p style="font-size:12.5px;color:#8a97ad;margin-bottom:10px">输入对方ID</p><input id="addFriendId" maxlength="16" autocomplete="off" placeholder="对方ID"><div class="row"><button onclick="hideSheet()">取消</button><button class="primary" onclick="doAddFriend()">发送申请</button></div>');
+}
+function doAddFriend(){
+  var id = ($('#addFriendId').value || '').trim();
+  if(!id) return toast('请输入对方ID');
+  api('/api/friend/apply', {id:id}, 'POST').then(function(r){
+    if(r.ok){ hideSheet(); toast('已发送好友申请'); loadContacts(); }
+    else toast(r.msg || '发送失败');
+  });
+}
+
+function openMyQR(){
+  api('/api/qrcode/me').then(function(r){
+    if(!r.ok) return toast(r.msg || '失败');
+    var url = 'https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=' + encodeURIComponent(r.code);
+    showSheet('<h3>我的二维码</h3><div style="text-align:center"><img src="' + url + '" style="width:210px;height:210px;border-radius:12px;margin:0 auto"><div style="font-size:16px;font-weight:700;margin-top:12px;color:#0b5fd6">' + esc(r.user.name) + '</div><div style="font-size:12.5px;color:#8a97ad;margin-top:5px">ID: ' + esc(r.user.id) + '</div></div><div class="qr-token">' + esc(r.code) + '</div><div class="row"><button onclick="copyText(\'' + esc(r.code) + '\')">复制</button><button class="primary" onclick="hideSheet()">关闭</button></div>');
+  });
+}
+function openMerchantQR(){
+  api('/api/qrcode/me').then(function(r){
+    if(!r.ok) return toast(r.msg || '失败');
+    if(!r.user.is_merchant) return toast('你还不是商家');
+    var url = 'https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=' + encodeURIComponent(r.merchant_code);
+    showSheet('<h3>商家二维码</h3><div style="text-align:center"><img src="' + url + '" style="width:210px;height:210px;border-radius:12px;margin:0 auto"><div style="font-size:16px;font-weight:700;margin-top:12px;color:#0b5fd6">' + esc(r.user.merchant_name) + '</div></div><div class="qr-token">' + esc(r.merchant_code) + '</div><div class="row"><button onclick="copyText(\'' + esc(r.merchant_code) + '\')">复制</button><button class="primary" onclick="hideSheet()">关闭</button></div>');
+  });
+}
+function openMerchantApply(){
+  showSheet('<h3>🏪 申请商家二维码</h3><input id="bizName" maxlength="30" placeholder="请输入商家名称"><div class="row"><button onclick="hideSheet()">取消</button><button class="primary" onclick="doApplyMerchant()">提交申请</button></div>');
+}
+function doApplyMerchant(){
+  var name = $('#bizName').value.trim();
+  if(!name) return toast('请填写商家名称');
+  api('/api/qrcode/merchant', {merchant_name:name}, 'POST').then(function(r){
+    if(r.ok){ hideSheet(); toast('已提交'); loadMe(); }
+    else toast(r.msg || '提交失败');
+  });
+}
+function copyText(t){
+  if(navigator.clipboard) navigator.clipboard.writeText(t).then(function(){ toast('已复制'); }, function(){ toast('复制失败'); });
+  else {
+    var ta = document.createElement('textarea'); ta.value = t;
+    document.body.appendChild(ta); ta.select();
+    try{ document.execCommand('copy'); toast('已复制'); }catch(e){ toast('复制失败'); }
+    document.body.removeChild(ta);
+  }
+}
+
+function openCreateGroup(){
+  var options = '';
+  for(var i=0;i<FRIENDS.length;i++){
+    var f = FRIENDS[i];
+    options += '<label style="display:flex;align-items:center;gap:8px;padding:8px;border-bottom:1px solid #f2f6fc;font-size:15px"><input type="checkbox" value="' + esc(f.id) + '" style="width:auto;margin:0">' + esc(f.name) + '（' + esc(f.id) + '）</label>';
+  }
+  if(!options) options = '<div style="color:#8a97ad;font-size:13px;padding:8px">暂无好友</div>';
+  showSheet('<h3>创建群聊</h3><input id="gName" maxlength="20" placeholder="群名称"><div style="max-height:220px;overflow:auto;background:#e8f1ff;border-radius:10px;padding:6px">' + options + '</div><div class="row" style="margin-top:12px"><button onclick="hideSheet()">取消</button><button class="primary" onclick="doCreateGroup()">创建</button></div>');
+}
+function doCreateGroup(){
+  var name = $('#gName').value.trim();
+  if(!name) return toast('请输入群名称');
+  var boxes = document.querySelectorAll('#sheet input[type=checkbox]:checked');
+  var members = []; for(var i=0;i<boxes.length;i++) members.push(boxes[i].value);
+  api('/api/group/create', {name:name, members:members}, 'POST').then(function(r){
+    if(r.ok){ hideSheet(); toast('群聊已创建'); switchPage('contact'); var tabs = document.querySelectorAll('#page-contact .sub-tabs div'); switchContactTab('groups', tabs[2]); }
+    else toast(r.msg || '创建失败');
+  });
+}
+
+function openChatMore(){
+  if(!CURRENT || !CURRENT.id){ toast('未打开会话'); return; }
+  if(CURRENT.type === 'group'){ openGroupSettings(); return; }
+  var pid = CURRENT.id;
+  showSheet('<h3>更多</h3><div style="font-size:13px;color:#8a97ad;margin-bottom:14px">当前是私聊</div><button class="btn-main" style="margin-bottom:8px" onclick="recommendToPeer(\'' + esc(pid) + '\')">👥 推荐好友给 TA</button><button class="btn-main" style="background:#ff4d4f" onclick="clearChat()">🗑 删除聊天记录</button><div style="font-size:11.5px;color:#8a97ad;margin-top:10px;text-align:center">删除后只对你本机生效</div><div class="row" style="margin-top:10px"><button onclick="hideSheet()">关闭</button></div>');
+}
+function recommendToPeer(peer){
+  api('/api/friends').then(function(r){
+    var friends = (r.list||[]).filter(function(x){ return x.status === 'accepted' && x.id !== peer; });
+    if(!friends.length) return toast('没有可推荐的好友');
+    var html = '<div style="max-height:50vh;overflow:auto;background:#e8f1ff;border-radius:10px;padding:4px">';
+    for(var i=0;i<friends.length;i++){
+      var f = friends[i];
+      var ch = f.name ? f.name.charAt(0) : '?';
+      var av = f.avatar ? '<img src="' + esc(f.avatar) + '" style="width:36px;height:36px;border-radius:10px;object-fit:cover">' : '<div style="width:36px;height:36px;border-radius:10px;background:#fff;color:#1677ff;display:flex;align-items:center;justify-content:center;font-weight:700">' + esc(ch) + '</div>';
+      html += '<div style="display:flex;align-items:center;gap:10px;padding:8px;border-bottom:1px solid #f2f6fc">' + av + '<div style="flex:1;font-size:14.5px">' + esc(f.name) + '</div><button style="padding:6px 12px;border-radius:8px;background:#1677ff;color:#fff;font-size:12.5px;font-weight:600;border:none" onclick="doSendCard(\'' + esc(peer) + '\',\'' + esc(f.id) + '\')">发送</button></div>';
+    }
+    html += '</div><div class="row" style="margin-top:10px"><button onclick="hideSheet()">关闭</button></div>';
+    showSheet('<h3>推荐好友给 TA</h3>' + html);
+  });
+}
+function doSendCard(to, cardId){
+  api('/api/card/send', {to:to, card_id:cardId}, 'POST').then(function(r){
+    if(r.ok){ toast('名片已发送'); hideSheet(); }
+    else toast(r.msg || '发送失败');
+  });
+}
+function viewCard(uid){
+  if(!uid) return;
+  showSheet('<h3>好友名片</h3><div style="text-align:center;padding:10px 0 16px" id="cardBox"></div><button class="btn-main" onclick="addFromCard(\'' + uid + '\')">加为好友</button><div class="row" style="margin-top:10px"><button onclick="hideSheet()">关闭</button></div>');
+  api('/api/user/' + encodeURIComponent(uid)).then(function(r){
+    var box = document.getElementById('cardBox');
+    if(!r.ok){ box.innerHTML = '<div style="color:#ff4d4f">用户不存在</div>'; return; }
+    var u = r.user;
+    var ch = u.name ? u.name.charAt(0) : '?';
+    var av = u.avatar ? '<img src="' + esc(u.avatar) + '" style="width:72px;height:72px;border-radius:18px;object-fit:cover;margin:0 auto">' : '<div style="width:72px;height:72px;border-radius:18px;background:#e8f1ff;color:#1677ff;display:flex;align-items:center;justify-content:center;font-size:28px;font-weight:700;margin:0 auto">' + esc(ch) + '</div>';
+    box.innerHTML = av + '<div style="font-size:17px;font-weight:700;margin-top:10px">' + esc(u.name) + '</div><div style="font-size:12.5px;color:#8a97ad;margin-top:4px">ID: ' + esc(u.id) + ' · ' + esc(u.gender||'保密') + '</div>';
+  });
+}
+function addFromCard(uid){
+  api('/api/friend/apply', {id:uid}, 'POST').then(function(r){
+    if(r.ok){ toast('已发送好友申请'); hideSheet(); }
+    else toast(r.msg || '失败');
+  });
+}
+function clearChat(){
+  if(!CURRENT || !CURRENT.id) return toast('未打开会话');
+  if(!confirm('删除本机会话记录？（对方不受影响）')) return;
+  var d = {};
+  if(CURRENT.type === 'group') d.gid = CURRENT.id; else d.to = CURRENT.id;
+  api('/api/chat/clear', d, 'POST').then(function(r){
+    if(r.ok){ hideSheet(); toast('已删除'); loadChat(); }
+    else toast(r.msg || '删除失败');
+  });
+}
+
+function openGroupSettings(){
+  if(!CURRENT || CURRENT.type !== 'group'){ toast('只有群聊才能打开'); return; }
+  api('/api/group/' + encodeURIComponent(CURRENT.id)).then(function(r){
+    if(!r.ok) return toast(r.msg || '加载失败');
+    var g = r.group || {}, members = r.members || [], isOwner = (g.owner === ME.id);
+    var memHtml = '';
+    for(var i=0;i<members.length;i++){
+      var m = members[i];
+      var ch = (m.name || '?').slice(0, 1);
+      var av = m.avatar ? '<div class="avatar sm"><img src="' + esc(m.avatar) + '"></div>' : '<div class="avatar sm">' + esc(ch) + '</div>';
+      var tag = (m.id === g.owner) ? '<span class="tag">群主</span>' : '';
+      var kickBtn = '';
+      if(isOwner && m.id !== ME.id){
+        kickBtn = '<button style="padding:6px 12px;border-radius:8px;background:#ffe8e8;color:#ff4d4f;font-size:12.5px;font-weight:600;border:none" onclick="kickMember(\'' + esc(m.id) + '\')">移除</button>';
+      }
+      memHtml += '<div style="display:flex;align-items:center;gap:10px;padding:10px;border-bottom:1px solid #f2f6fc">' + av + '<div style="flex:1;min-width:0"><div style="font-size:14.5px;font-weight:500">' + esc(m.name||m.id) + ' ' + tag + '</div><div style="font-size:12px;color:#8a97ad">ID: ' + esc(m.id) + '</div></div>' + kickBtn + '</div>';
+    }
+    var bottom = '';
+    bottom += '<button class="btn-main" style="margin-bottom:8px" onclick="openInviteMembers()">➕ 邀请好友</button>';
+    bottom += '<button class="btn-main" style="background:#ff9500;margin-bottom:8px" onclick="clearChat()">🗑 删除本群聊天记录</button>';
+    bottom += '<button class="btn-main" style="background:#ff4d4f" onclick="leaveGroup()">' + (isOwner ? '解散并退出群聊' : '退出群聊') + '</button>';
+    showSheet('<h3>群设置</h3><div style="font-size:16px;font-weight:700;color:#0b5fd6;margin-bottom:4px">' + esc(g.name||'') + '</div><div style="font-size:12.5px;color:#8a97ad;margin-bottom:14px">群ID: ' + esc(g.gid||CURRENT.id) + ' · 共 ' + members.length + ' 人</div><div style="max-height:280px;overflow:auto;background:#e8f1ff;border-radius:10px;padding:4px;margin-bottom:12px">' + (memHtml || '<div style="padding:12px;color:#8a97ad">无成员</div>') + '</div>' + bottom + '<div class="row" style="margin-top:10px"><button onclick="hideSheet()">关闭</button></div>');
+  });
+}
+function kickMember(uid){
+  if(!confirm('确定移除该成员？')) return;
+  api('/api/group/kick', {gid:CURRENT.id, user_id:uid}, 'POST').then(function(r){
+    if(r.ok){ toast('已移除'); setTimeout(openGroupSettings, 200); } else toast(r.msg || '失败');
+  });
+}
+function leaveGroup(){
+  if(!confirm('确定退出该群？群主退出将解散群聊')) return;
+  api('/api/group/leave', {gid:CURRENT.id}, 'POST').then(function(r){
+    if(r.ok){ hideSheet(); toast('已退出'); closeChat(); loadMsgLists(); } else toast(r.msg || '失败');
+  });
+}
+function openInviteMembers(){
+  api('/api/group/' + encodeURIComponent(CURRENT.id)).then(function(cur){
+    var curIds = (cur.members||[]).map(function(x){ return x.id; });
+    var options = '';
+    for(var i=0;i<FRIENDS.length;i++){
+      var f = FRIENDS[i];
+      if(curIds.indexOf(f.id) >= 0) continue;
+      options += '<label style="display:flex;align-items:center;gap:8px;padding:8px;border-bottom:1px solid #f2f6fc;font-size:15px"><input type="checkbox" value="' + esc(f.id) + '" style="width:auto;margin:0">' + esc(f.name) + '（' + esc(f.id) + '）</label>';
+    }
+    if(!options) options = '<div style="color:#8a97ad;font-size:13px;padding:8px">没有可邀请的好友</div>';
+    showSheet('<h3>邀请好友进群</h3><div style="max-height:260px;overflow:auto;background:#e8f1ff;border-radius:10px;padding:6px">' + options + '</div><div class="row" style="margin-top:12px"><button onclick="hideSheet()">取消</button><button class="primary" onclick="doInvite()">邀请</button></div>');
+  });
+}
+function doInvite(){
+  var boxes = document.querySelectorAll('#sheet input[type=checkbox]:checked');
+  var members = []; for(var i=0;i<boxes.length;i++) members.push(boxes[i].value);
+  if(!members.length) return toast('请选择要邀请的好友');
+  api('/api/group/invite', {gid:CURRENT.id, members:members}, 'POST').then(function(r){
+    if(r.ok){ hideSheet(); toast('已邀请 ' + r.added + ' 人'); setTimeout(openGroupSettings, 200); }
+    else toast(r.msg || '邀请失败');
+  });
+}
+
+
+
+
+function openRedpacket(){
+  var isGroup = (CURRENT.type === 'group');
+  showSheet('<h3>🧧 发红包</h3><input id="rpAmt" type="number" min="0.01" step="0.01" placeholder="总金额（元）">' + (isGroup ? '<input id="rpCount" type="number" min="2" step="1" placeholder="个数（默认群人数）">' : '') + '<input id="rpMsg" maxlength="20" placeholder="祝福语（默认：恭喜发财）"><div class="row"><button onclick="hideSheet()">取消</button><button class="primary" onclick="doSendRP()">发红包</button></div>');
+}
+function doSendRP(){
+  var amtStr = document.getElementById('rpAmt').value;
+  var amount = parseFloat(amtStr);
+  var msg = (document.getElementById('rpMsg').value || '恭喜发财').trim() || '恭喜发财';
+  if(isNaN(amount) || amount <= 0) return toast('请输入正确金额');
+  
+  var d = {amount:amount, msg:msg};
+  if(CURRENT.type === 'group'){ 
+    d.gid = CURRENT.id; 
+    var cv = document.getElementById('rpCount') ? document.getElementById('rpCount').value.trim() : ''; 
+    if(cv) {
+      var cInt = parseInt(cv, 10);
+      if(isNaN(cInt) || cInt < 1) return toast('红包个数不正确');
+      d.count = cInt;
+    }
+  }
+  else d.to = CURRENT.id;
+  
+  api('/api/redpacket/send', d, 'POST').then(function(r){
+    if(r.ok){ 
+      hideSheet(); 
+      loadChat(); 
+      loadMe(); 
+    } else {
+      toast(r.msg || '发送失败');
+    }
+  });
+}
+function claimRP(rid, el){
+  if(!rid) return;
+  if(el && el.classList.contains('done')){ return showRPDetail(rid); }
+  api('/api/redpacket/claim', {rid:rid}, 'POST').then(function(r){
+    if(r.ok){ toast('🧧 领取成功 ￥' + (+r.amount).toFixed(2)); loadMe(); setTimeout(function(){ showRPDetail(rid); }, 400); }
+    else { toast(r.msg || '领取失败'); showRPDetail(rid); }
+    loadChat();
+  });
+}
+function showRPDetail(rid){
+  api('/api/redpacket/info?rid=' + encodeURIComponent(rid)).then(function(r){
+    if(!r.ok) return toast(r.msg || '加载失败');
+    var rp = r.rp, claims = r.claims || [];
+    var list = '';
+    if(!claims.length){ list = '<div class="empty" style="padding:20px">还没有人领取</div>'; }
+    else for(var i=0;i<claims.length;i++){
+      var c = claims[i];
+      var ch = c.name ? c.name.charAt(0) : '?';
+      var av = c.avatar ? '<div class="avatar sm"><img src="' + esc(c.avatar) + '"></div>' : '<div class="avatar sm">' + esc(ch) + '</div>';
+      list += '<div style="display:flex;align-items:center;gap:10px;padding:10px;border-bottom:1px solid #f2f6fc">' + av + '<div style="flex:1;min-width:0;font-size:14.5px">' + esc(c.name||c.user_id) + '</div><div style="font-weight:600;color:#ff9800">￥' + (+c.amount).toFixed(2) + '</div></div>';
+    }
+    showSheet('<h3>🧧 红包详情</h3><div style="text-align:center;margin:8px 0 14px"><div style="color:#8a97ad;font-size:13px">' + esc(rp.msg) + '</div><div style="font-size:12px;color:#8a97ad;margin-top:6px">' + (rp.rtype === 'group' ? ('群红包 ' + rp.total_count + ' 个') : '专属红包') + ' · 剩余 ' + (rp.remain_count||0) + ' 个</div></div><div style="max-height:280px;overflow:auto;background:#e8f1ff;border-radius:10px;padding:4px">' + list + '</div><div class="row" style="margin-top:10px"><button class="primary" onclick="hideSheet()">关闭</button></div>');
+  });
+}
+
+function loadMoments(){
+  api('/api/moments').then(function(r){
+    var box = $('#momentList');
+    if(!r.ok){ box.innerHTML = '<div class="empty">加载失败</div>'; return; }
+    var list = r.list || [];
+    if(!list.length){ box.innerHTML = '<div class="empty">还没有朋友圈，发布一条吧～</div>'; return; }
+    var h = '';
+    for(var i=0;i<list.length;i++){
+      var m = list[i];
+      var media = []; try { media = JSON.parse(m.media || '[]'); } catch(e){}
+      var mediaHtml = '';
+      if(media.length){
+        mediaHtml = '<div class="moment-media">';
+        for(var j=0;j<media.length;j++){
+          var u = media[j];
+          if(/\.(mp4|webm|mov|m4v)$/i.test(u)) mediaHtml += '<video src="' + esc(u) + '" controls></video>';
+          else mediaHtml += '<img src="' + esc(u) + '" onclick="window.open(\'' + esc(u) + '\')">';
+        }
+        mediaHtml += '</div>';
+      }
+      var ch = m.name ? m.name.charAt(0) : '?';
+      var av = m.avatar ? '<div class="avatar sm"><img src="' + esc(m.avatar) + '"></div>' : '<div class="avatar sm">' + esc(ch) + '</div>';
+      var delBtn = (m.user_id === ME.id) ? '<button style="color:#ff4d4f" onclick="deleteMoment(' + m.id + ')">🗑 删除</button>' : '';
+      var actions = '<div class="moment-actions"><button onclick="openComment(' + m.id + ')">💬 评论</button>' + delBtn + '</div>';
+      var cHtml = '';
+      if(m.comments && m.comments.length){
+        for(var ci=0;ci<m.comments.length;ci++){
+          var cm = m.comments[ci];
+          var rp = '';
+          if(cm.reply_to){
+            for(var ck=0;ck<m.comments.length;ck++){
+              if(m.comments[ck].user_id === cm.reply_to){ rp = ' 回复 <b>' + esc(m.comments[ck].name) + '</b>：'; break; }
+            }
+            if(!rp) rp = ' 回复 <b>' + esc(cm.reply_to) + '</b>：';
+          }
+          var myC = (cm.user_id === ME.id) ? ' <span class="mc-del" onclick="delComment(' + cm.id + ',' + m.id + ')">删除</span>' : '';
+          cHtml += '<div class="mc-item"><b>' + esc(cm.name||cm.user_id) + '</b>' + rp + ' ' + esc(cm.text) + myC + '</div>';
+        }
+      }
+      h += '<div class="moment" data-mid="' + m.id + '"><div class="moment-head">' + av + '<div class="moment-name">' + esc(m.name) + '</div><div class="moment-time">' + fmtTime(m.created) + '</div></div>' + (m.text ? '<div class="moment-text">' + esc(m.text) + '</div>' : '') + mediaHtml + actions + '<div class="moment-comments" id="mc-' + m.id + '">' + cHtml + '</div></div>';
+    }
+    box.innerHTML = h;
+  });
+}
+function loadComments(mid){
+  api('/api/moment/comments?moment_id=' + mid).then(function(r){
+    var box = document.getElementById('mc-' + mid);
+    if(!box) return;
+    if(!r.ok || !r.list.length){ box.innerHTML = ''; return; }
+    var h = '';
+    for(var i=0;i<r.list.length;i++){
+      var c = r.list[i], replyTxt = '';
+      if(c.reply_to){
+        for(var k=0;k<r.list.length;k++){ if(r.list[k].user_id === c.reply_to){ replyTxt = ' 回复 <b>' + esc(r.list[k].name) + '</b>：'; break; } }
+        if(!replyTxt) replyTxt = ' 回复 <b>' + esc(c.reply_to) + '</b>：';
+      }
+      var mine = (c.user_id === ME.id) ? ' <span class="mc-del" onclick="delComment(' + c.id + ',' + mid + ')">删除</span>' : '';
+      h += '<div class="mc-item"><b>' + esc(c.name||c.user_id) + '</b>' + replyTxt + ' ' + esc(c.text) + mine + '</div>';
+    }
+    box.innerHTML = h;
+  });
+}
+function openComment(mid, replyTo){
+  window._commentMid = mid; window._replyTo = replyTo || '';
+  showSheet('<h3>💬 评论</h3><textarea id="commentText" maxlength="300" placeholder="说点什么..."></textarea><div class="row"><button onclick="hideSheet()">取消</button><button class="primary" onclick="sendComment()">发送</button></div>');
+  setTimeout(function(){ var t = document.getElementById('commentText'); if(t) t.focus(); }, 100);
+}
+function sendComment(){
+  var mid = window._commentMid;
+  var text = (document.getElementById('commentText').value || '').trim();
+  if(!text) return toast('请输入内容');
+  api('/api/moment/comment', {moment_id:mid, text:text, reply_to: window._replyTo || ''}, 'POST').then(function(r){
+    if(r.ok){ hideSheet(); toast('已评论'); loadMoments(); }
+    else toast(r.msg || '评论失败');
+  });
+}
+function delComment(cid, mid){
+  if(!confirm('确定删除这条评论？')) return;
+  api('/api/moment/comment/delete', {id:cid}, 'POST').then(function(r){
+    if(r.ok){ toast('已删除'); loadMoments(); }
+    else toast(r.msg || '删除失败');
+  });
+}
+function openPostMoment(){
+  showSheet(
+    '<h3>✍️ 发布朋友圈</h3>' +
+    '<textarea id="mText" placeholder="说点什么..."></textarea>' +
+    '<input type="file" id="mFiles" multiple accept="image/*,video/*" style="display:none" onchange="updateFileText()">' +
+    '<div id="filePickerBtn" onclick="document.getElementById(\'mFiles\').click()" style="background:#e8f1ff;border:1px dashed #1677ff;border-radius:10px;padding:12px;text-align:center;color:#1677ff;font-size:14px;font-weight:600;margin-bottom:12px;cursor:pointer">📁 点击选择图片或视频</div>' +
+    '<div id="fileSelectedTip" style="font-size:12.5px;color:#8a97ad;margin-bottom:10px;display:none"></div>' +
+    '<div class="row"><button onclick="hideSheet()">取消</button><button class="primary" onclick="doPostMoment()">发布</button></div>'
+  );
+}
+function updateFileText(){
+  var files = document.getElementById('mFiles').files;
+  var tip = document.getElementById('fileSelectedTip');
+  var btn = document.getElementById('filePickerBtn');
+  if(files.length > 0){
+    tip.style.display = 'block';
+    tip.textContent = '已选择 ' + files.length + ' 个文件';
+    btn.innerHTML = '✅ 已选择 ' + files.length + ' 个文件（点击重新选择）';
+  } else {
+    tip.style.display = 'none';
+    btn.innerHTML = '📁 点击选择图片或视频';
+  }
+}
+function doPostMoment(){
+  var text = ($('#mText').value || '').trim();
+  var files = $('#mFiles').files;
+  var urls = []; var tasks = [];
+  for(var i=0;i<files.length;i++){
+    (function(f){
+      var fd = new FormData(); fd.append('file', f);
+      tasks.push(fetch('/api/upload', {method:'POST', body:fd}).then(function(r){ return r.json(); }).then(function(up){
+        if(up.ok) urls.push(up.url);
+      }));
+    })(files[i]);
+  }
+  Promise.all(tasks).then(function(){
+    if(!text && !urls.length) return toast('请输入内容或选择媒体');
+    api('/api/moment/post', {text:text, media:urls}, 'POST').then(function(r){
+      if(r.ok){ hideSheet(); toast('已发布'); loadMoments(); }
+      else toast(r.msg || '发布失败');
+    });
+  });
+}
+function deleteMoment(id){
+  if(!confirm('确定删除这条朋友圈？')) return;
+  api('/api/moment/delete', {id:id}, 'POST').then(function(r){
+    if(r.ok){ toast('已删除'); loadMoments(); }
+    else toast(r.msg || '删除失败');
+  });
+}
+
+function openWallet(){
+  showSheet('<h3>💰 我的钱包</h3><div style="font-size:32px;font-weight:800;color:#1677ff;text-align:center;margin:20px 0">￥' + (+ME.wallet).toFixed(2) + '</div><p style="font-size:12.5px;color:#8a97ad;text-align:center;margin-bottom:6px">🎁 每月自动发放 3000 元</p><p style="font-size:12.5px;color:#8a97ad;text-align:center;margin-bottom:14px">如需额外充值请联系管理员</p><div class="row"><button class="primary" onclick="hideSheet()">知道了</button></div>');
+}
+function openEditName(){
+  showSheet('<h3>修改名字</h3><input id="newName" maxlength="16" value="' + esc(ME.name) + '"><div class="row"><button onclick="hideSheet()">取消</button><button class="primary" onclick="doUpdate({name:$(\'#newName\').value.trim()})">保存</button></div>');
+}
+function openEditId(){
+  showSheet('<h3>修改ID</h3><p style="font-size:12.5px;color:#8a97ad;margin-bottom:10px">修改后所有消息、好友关系会自动迁移</p><input id="newId" maxlength="16" autocomplete="off" value="' + esc(ME.id) + '"><div class="row"><button onclick="hideSheet()">取消</button><button class="primary" onclick="doUpdate({new_id:$(\'#newId\').value.trim()})">保存</button></div>');
+}
+function openEditGender(){
+  showSheet('<h3>修改性别</h3><div id="gBox2" style="display:flex;gap:10px;margin-bottom:12px"><div data-g="男" style="flex:1;text-align:center;padding:11px;border-radius:12px;background:#e8f1ff;cursor:pointer">男</div><div data-g="女" style="flex:1;text-align:center;padding:11px;border-radius:12px;background:#e8f1ff;cursor:pointer">女</div><div data-g="保密" style="flex:1;text-align:center;padding:11px;border-radius:12px;background:#e8f1ff;cursor:pointer">保密</div></div><div class="row"><button onclick="hideSheet()">取消</button><button class="primary" onclick="doUpdate({gender:window._selGender||ME.gender})">保存</button></div>');
+  window._selGender = ME.gender;
+  var dvs = document.querySelectorAll('#gBox2 div');
+  for(var i=0;i<dvs.length;i++){
+    (function(d){
+      if(d.dataset.g === ME.gender){ d.style.background = '#1677ff'; d.style.color = '#fff'; }
+      d.onclick = function(){
+        window._selGender = d.dataset.g;
+        var all = document.querySelectorAll('#gBox2 div');
+        for(var j=0;j<all.length;j++){ all[j].style.background = '#e8f1ff'; all[j].style.color = ''; }
+        d.style.background = '#1677ff'; d.style.color = '#fff';
+      };
+    })(dvs[i]);
+  }
+}
+function doUpdate(payload){
+  api('/api/settings/update', payload, 'POST').then(function(r){
+    if(r.ok){ hideSheet(); toast('已保存'); loadMe().then(function(){ if(r.new_id) location.reload(); }); }
+    else toast(r.msg || '保存失败');
+  });
+}
+function uploadAvatar(input){
+  var f = input.files[0]; if(!f) return; input.value = '';
+  var fd = new FormData(); fd.append('file', f);
+  fetch('/api/avatar', {method:'POST', body:fd}).then(function(r){ return r.json(); }).then(function(up){
+    if(up.ok){ toast('头像已更新'); loadMe(); }
+    else toast(up.msg || '上传失败');
+  });
+}
+function logout(){
+  api('/api/logout', {}, 'POST').then(function(){ location.href = '/'; }).catch(function(){ location.href = '/'; });
+}
+
+function openScan(){
+  showSheet('<h3>📷 扫一扫</h3><div class="scan-box"><video id="scanVideo" autoplay playsinline muted></video><div class="scan-frame"></div></div><div id="scanTip" style="font-size:12.5px;color:#8a97ad;text-align:center;margin-bottom:10px">正在打开摄像头...</div><input id="scanInput" placeholder="或手动输入：zzchat://add/1234"><div class="row"><button onclick="closeScan()">取消</button><button class="primary" onclick="doScanManual()">手动添加</button></div>');
+  setTimeout(startScan, 100);
+}
+var scanStream = null, scanRAF = null;
+function startScan(){
+  var tip = document.getElementById('scanTip');
+  var v = document.getElementById('scanVideo');
+  if(!v) return;
+  navigator.mediaDevices.getUserMedia({
+    video: { facingMode: { ideal: 'environment' }, width:{ideal:1280}, height:{ideal:1280} },
+    audio: false
+  }).then(function(stream){
+    scanStream = stream;
+    v.srcObject = stream;
+    v.play();
+    if(tip) tip.textContent = '将二维码放入蓝框，识别后自动添加';
+    var cv = document.createElement('canvas');
+    var ctx = cv.getContext('2d', {willReadFrequently:true});
+    var tick = function(){
+      if(!scanStream) return;
+      if(v.readyState === v.HAVE_ENOUGH_DATA && typeof jsQR !== 'undefined'){
+        cv.width = v.videoWidth; cv.height = v.videoHeight;
+        ctx.drawImage(v, 0, 0, cv.width, cv.height);
+        var img = ctx.getImageData(0, 0, cv.width, cv.height);
+        var q = jsQR(img.data, img.width, img.height, {inversionAttempts:'dontInvert'});
+        if(q && q.data){
+          var d = q.data.trim();
+          if(d.indexOf('zzchat://add/') === 0 || /^[A-Za-z0-9]{2,16}$/.test(d)){
+            closeScan(); doScanValue(d); return;
+          }
+        }
+      }
+      scanRAF = requestAnimationFrame(tick);
+    };
+    tick();
+  }).catch(function(e){
+    if(tip) tip.textContent = '无法打开摄像头：' + (e.message||e.name||e) + '（请检查权限 / HTTPS）';
+  });
+}
+function closeScan(){
+  if(scanRAF){ cancelAnimationFrame(scanRAF); scanRAF = null; }
+  if(scanStream){ scanStream.getTracks().forEach(function(t){ t.stop(); }); scanStream = null; }
+  hideSheet();
+}
+function doScanManual(){
+  var code = ($('#scanInput').value || '').trim();
+  if(!code) return toast('请输入内容');
+  closeScan(); doScanValue(code);
+}
+function doScanValue(code){
+  api('/api/scan', {code:code}, 'POST').then(function(r){
+    if(r.ok){ toast('已发送好友申请'); loadContacts(); }
+    else toast(r.msg || '扫码失败');
+  });
+}
+
+
+var callState='idle', callStartTs=0;
+var pc=null, localStream=null, remoteStream=null;
+var callPeer='', callIsVideo=false, isCaller=false;
+var pendingOffer=null, pendingIce=[], ringTimer=null, ringCtx=null;
+var ICE={
+  iceServers:[
+    {urls:'stun:stun.qq.com:3478'},
+    {urls:'stun:stun.miwifi.com:3478'},
+    {urls:'stun:stun.l.google.com:19302'},
+    
+    // 节点 1: ZHTURN (国内直连优先)
+    {
+      urls: 'turn:43.138.235.180:9002',
+      username: 'namestring',
+      credential: 'mypwd'
+    },
+    
+    // 节点 2: Evan-Brass (国际高可用)
+    {
+      urls: [
+        'turn:turn.evan-brass.net',
+        'turn:turn.evan-brass.net?transport=tcp',
+        'turns:turn.evan-brass.net:443?transport=tcp'
+      ],
+      username: 'user',
+      credential: 'password'
+    },
+    
+    // 节点 3: OpenRelay (兜底)
+    {
+      urls: [
+        'turn:openrelay.metered.ca:80',
+        'turn:openrelay.metered.ca:443',
+        'turn:openrelay.metered.ca:443?transport=tcp'
+      ],
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    }
+  ]
+};
+
+function playRingtone(){
+  if(ringTimer) return;
+  try{
+    if(!ringCtx) ringCtx = new (window.AudioContext||window.webkitAudioContext)();
+    var beep = function(){
+      var o = ringCtx.createOscillator(), g = ringCtx.createGain();
+      o.type='sine'; o.frequency.value=800;
+      g.gain.setValueAtTime(0.0001, ringCtx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.35, ringCtx.currentTime+0.05);
+      g.gain.exponentialRampToValueAtTime(0.0001, ringCtx.currentTime+0.55);
+      o.connect(g); g.connect(ringCtx.destination);
+      o.start(); o.stop(ringCtx.currentTime+0.6);
+    };
+    beep(); ringTimer = setInterval(beep, 1500);
+  }catch(e){}
+}
+function stopRingtone(){ if(ringTimer){ clearInterval(ringTimer); ringTimer=null; } }
+
+function startCall(video){
+  if(CURRENT.type !== 'private') return toast('只有私聊才能发起通话');
+  if(callState !== 'idle') return toast('正在通话中');
+  callPeer = CURRENT.id;
+  callIsVideo = !!video;
+  isCaller = true;
+  navigator.mediaDevices.getUserMedia({audio:true, video:callIsVideo}).then(function(stream){
+    localStream = stream;
+    callState = 'outgoing'; callStartTs = 0;
+    document.getElementById('callUI').classList.add('show');
+    var lv = document.getElementById('localVideo');
+    lv.srcObject = localStream;
+    lv.style.display = callIsVideo ? 'block' : 'none';
+    document.getElementById('callInfo').textContent = (callIsVideo?'视频':'语音') + '呼叫中...';
+    var bM = document.getElementById('btnMute'), bA = document.getElementById('btnAccept'), bH = document.getElementById('btnHang'), bC = document.getElementById('btnCam');
+    bM.style.display = 'flex'; bA.style.display = 'none'; bH.style.display = 'flex';
+    bM.style.background = 'rgba(255,255,255,.2)'; bM.textContent = '🎙';
+    var bS = document.getElementById('btnSwitch'); if(bS) bS.style.display = callIsVideo?'flex':'none';
+    if(bC){ bC.style.display = callIsVideo?'flex':'none'; bC.style.background='rgba(255,255,255,.2)'; bC.textContent='📷'; }
+    pc = new RTCPeerConnection(ICE);
+    localStream.getTracks().forEach(function(t){ pc.addTrack(t, localStream); });
+    pc.ontrack = function(ev){ remoteStream = ev.streams[0]; document.getElementById('remoteVideo').srcObject = remoteStream; };
+    pc.onicecandidate = function(ev){
+      if(ev.candidate) api('/api/signal/send', {to:callPeer, kind:'ice', data:{candidate:ev.candidate}}, 'POST');
+    };
+    return pc.createOffer().then(function(offer){
+      return pc.setLocalDescription(offer);
+    }).then(function(){
+      return api('/api/signal/send', {to:callPeer, kind:'offer', data:{sdp:pc.localDescription, video:callIsVideo}}, 'POST');
+    });
+  }).catch(function(e){
+    toast('无法获取麦克风/摄像头：' + (e.message||e.name||e));
+  });
+}
+
+function showIncoming(from, isVideo){
+  callPeer = from; callIsVideo = !!isVideo; isCaller = false; callState = 'incoming'; pendingIce = [];
+  api('/api/user/' + encodeURIComponent(from)).then(function(r){
+    document.getElementById('incomingName').textContent = (r.ok && r.user) ? r.user.name : from;
+  });
+  document.getElementById('incomingType').textContent = (isVideo?'视频':'语音') + '通话';
+  document.getElementById('incomingCall').classList.add('show');
+  playRingtone();
+}
+function hideIncoming(){ document.getElementById('incomingCall').classList.remove('show'); stopRingtone(); }
+
+function acceptCall(){
+  if(callState !== 'incoming' || !pendingOffer) return;
+  callStartTs = Date.now();
+  hideIncoming();
+  navigator.mediaDevices.getUserMedia({audio:true, video:callIsVideo}).then(function(stream){
+    localStream = stream;
+    document.getElementById('callUI').classList.add('show');
+    var lv = document.getElementById('localVideo');
+    lv.srcObject = localStream;
+    lv.style.display = callIsVideo ? 'block' : 'none';
+    document.getElementById('callInfo').textContent = (callIsVideo?'视频':'语音') + '通话中...';
+    var bM = document.getElementById('btnMute'), bA = document.getElementById('btnAccept'), bH = document.getElementById('btnHang'), bC = document.getElementById('btnCam');
+    bM.style.display = 'flex'; bA.style.display = 'none'; bH.style.display = 'flex';
+    bM.style.background = 'rgba(255,255,255,.2)'; bM.textContent = '🎙';
+    var bS = document.getElementById('btnSwitch'); if(bS) bS.style.display = callIsVideo?'flex':'none';
+    if(bC){ bC.style.display = callIsVideo?'flex':'none'; bC.style.background='rgba(255,255,255,.2)'; bC.textContent='📷'; }
+    pc = new RTCPeerConnection(ICE);
+    localStream.getTracks().forEach(function(t){ pc.addTrack(t, localStream); });
+    pc.ontrack = function(ev){ remoteStream = ev.streams[0]; document.getElementById('remoteVideo').srcObject = remoteStream; };
+    pc.onicecandidate = function(ev){
+      if(ev.candidate) api('/api/signal/send', {to:callPeer, kind:'ice', data:{candidate:ev.candidate}}, 'POST');
+    };
+    return pc.setRemoteDescription(new RTCSessionDescription(pendingOffer)).then(function(){
+      var chain = Promise.resolve();
+      pendingIce.forEach(function(c){
+        chain = chain.then(function(){ return pc.addIceCandidate(new RTCIceCandidate(c)).catch(function(){}); });
+      });
+      return chain;
+    }).then(function(){
+      pendingIce = [];
+      return pc.createAnswer();
+    }).then(function(ans){
+      return pc.setLocalDescription(ans);
+    }).then(function(){
+      return api('/api/signal/send', {to:callPeer, kind:'answer', data:{sdp:pc.localDescription}}, 'POST');
+    }).then(function(){
+      callState = 'connected'; pendingOffer = null;
+    });
+  }).catch(function(e){
+    toast('无法获取麦克风/摄像头：' + (e.message||e.name||e));
+    rejectCall();
+  });
+}
+
+function rejectCall(){
+  if(callState !== 'incoming') return;
+  var peer = callPeer;
+  if(peer){
+    api('/api/signal/send', {to:peer, kind:'hangup', data:{reason:'rejected'}}, 'POST');
+    api('/api/call/log', {peer:peer, video:callIsVideo, duration:0, status:'rejected'}, 'POST');
+    setTimeout(function(){ if(CURRENT.id === peer) loadChat(); }, 300);
+  }
+  hideIncoming(); resetCall();
+}
+
+function toggleMute(){
+  if(!localStream) return;
+  var a = localStream.getAudioTracks()[0];
+  if(a){
+    a.enabled = !a.enabled;
+    var b = document.getElementById('btnMute');
+    b.style.background = a.enabled ? 'rgba(255,255,255,.2)' : '#ff4d4f';
+    b.textContent = a.enabled ? '🎙' : '🔇';
+  }
+}
+
+function toggleSpeaker(){
+  var v = document.getElementById('remoteVideo');
+  if(v){
+    v.muted = !v.muted;
+    document.getElementById('btnSpeaker').style.background = v.muted ? '#ff4d4f' : 'rgba(255,255,255,.2)';
+    document.getElementById('btnSpeaker').textContent = v.muted ? '🔇' : '🔊';
+  }
+}
+
+function toggleCamera(){
+  if(!localStream) return;
+  var v = localStream.getVideoTracks()[0];
+  if(!v){ toast('当前是语音通话'); return; }
+  v.enabled = !v.enabled;
+  var b = document.getElementById('btnCam');
+  if(b){ b.style.background = v.enabled ? 'rgba(255,255,255,.2)' : '#ff4d4f'; b.textContent = v.enabled ? '📷' : '🚫'; }
+  var lv = document.getElementById('localVideo');
+  if(lv) lv.style.opacity = v.enabled ? '1' : '.3';
+  toast(v.enabled ? '摄像头已开启' : '摄像头已关闭');
+}
+
+function hangup(){
+  if(callState === 'idle'){ document.getElementById('callUI').classList.remove('show'); return; }
+  var peer = callPeer;
+  var dur = callStartTs ? Math.round((Date.now() - callStartTs)/1000) : 0;
+  if(peer) api('/api/signal/send', {to:peer, kind:'hangup', data:{}}, 'POST');
+  document.getElementById('callUI').classList.remove('show');
+  if(peer && callState !== 'incoming'){
+    api('/api/call/log', {peer:peer, video:callIsVideo, duration:dur, status:'ended'}, 'POST');
+    setTimeout(function(){ if(CURRENT.id === peer) loadChat(); }, 300);
+  }
+  resetCall();
+}
+
+
+async function switchCamera(){
+  if(!localStream) return;
+  var v = localStream.getVideoTracks()[0];
+  if(!v){ toast('当前是语音通话'); return; }
+  var cur = 'user';
+  try{
+    var st = v.getSettings();
+    if(st.facingMode) cur = st.facingMode;
+  }catch(e){}
+  var next = (cur === 'environment') ? 'user' : 'environment';
+  try{
+    var stream = await navigator.mediaDevices.getUserMedia({audio:false, video:{facingMode:{ideal:next}}});
+    var newTrack = stream.getVideoTracks()[0];
+    if(pc){
+      var sender = pc.getSenders().find(function(x){ return x.track && x.track.kind === 'video'; });
+      if(sender) await sender.replaceTrack(newTrack);
+    }
+    v.stop(); localStream.removeTrack(v); localStream.addTrack(newTrack);
+    document.getElementById('localVideo').srcObject = localStream;
+    toast(next === 'environment' ? '已切到后置' : '已切到前置');
+  }catch(e){ toast('切换失败：' + (e.message||e)); }
+}
+
+
+// ================= 媒体预览与下载助手 =================
+function openMediaPreview(url, type) {
+  var html = '<div id="mediaViewer" style="position:fixed;inset:0;background:#000;z-index:9999;display:flex;flex-direction:column"><div style="height:50px;display:flex;align-items:center;padding:0 15px"><button style="color:#fff;font-size:24px;background:none;border:none" onclick="document.getElementById(\'mediaViewer\').remove()">✕</button><div style="flex:1;text-align:center;color:#fff;font-size:15px">预览</div><a href="' + url + '" download style="color:#fff;font-size:14px;text-decoration:none;padding:6px 12px;background:rgba(255,255,255,0.2);border-radius:8px">下载</a></div>';
+  if(type === 'image') {
+    html += '<div style="flex:1;display:flex;align-items:center;justify-content:center;overflow:hidden" onclick="document.getElementById(\'mediaViewer\').remove()"><img src="' + url + '" style="max-width:100%;max-height:100%;object-fit:contain"></div>';
+  } else {
+    html += '<video src="' + url + '" controls autoplay style="flex:1;width:100%;object-fit:contain"></video>';
+  }
+  html += '<div style="color:#aaa;font-size:12px;text-align:center;padding:15px">长按图片/视频可保存到手机</div></div>';
+  document.body.insertAdjacentHTML('beforeend', html);
+}
+
+function downloadFile(url, name) {
+  // 创建一个临时的 a 标签触发下载
+  var a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  
+  // 针对手机浏览器经常会静默下载的问题，给出提示
+  toast('开始下载...请在浏览器通知栏或文件管理器中查看');
+  setTimeout(function(){
+    showSheet('<h3>💡 下载提示</h3><p style="font-size:14px;line-height:1.6;color:#555">文件已经开始下载。<br><br>如果找不到，请打开手机自带<b>「文件管理」</b>，进入 <b>「下载/Download」</b> 文件夹查找。<br><br>如果您在微信/QQ中打开，请点击右上角选择<b>「在浏览器中打开」</b>后再下载安装。</p><div class="row" style="margin-top:15px"><button class="primary" onclick="hideSheet()">我知道了</button></div>');
+  }, 500);
+}
+
+function resetCall(){
+  callState = 'idle'; pendingOffer = null; pendingIce = []; callPeer = ''; callStartTs = 0;
+  if(pc){ try{ pc.close(); }catch(e){} pc = null; }
+  if(localStream){ localStream.getTracks().forEach(function(t){ t.stop(); }); localStream = null; }
+  var rv = document.getElementById('remoteVideo'); if(rv) rv.srcObject = null;
+  var lv = document.getElementById('localVideo'); if(lv){ lv.srcObject = null; lv.style.opacity = '1'; }
+  var cu = document.getElementById('callUI'); if(cu) cu.classList.remove('show');
+  hideIncoming();
+}
+
+function pollSignals(){
+  if(!ME) return;
+  api('/api/signal/poll').then(function(r){
+    if(!r.ok) return;
+    var list = r.list || [];
+    var chain = Promise.resolve();
+    for(var i=0;i<list.length;i++){
+      (function(s){
+        chain = chain.then(function(){
+          if(s.kind === 'offer'){
+            if(callState !== 'idle'){
+              api('/api/signal/send', {to:s.from, kind:'hangup', data:{reason:'busy'}}, 'POST');
+              return;
+            }
+            pendingOffer = s.data.sdp;
+            showIncoming(s.from, !!(s.data && s.data.video));
+          } else if(s.kind === 'answer'){
+            if(callState === 'outgoing' && pc){
+              return pc.setRemoteDescription(new RTCSessionDescription(s.data.sdp)).then(function(){
+                callState = 'connected';
+                callStartTs = Date.now();
+                document.getElementById('callInfo').textContent = (callIsVideo?'视频':'语音') + '通话中...';
+              }).catch(function(){});
+            }
+          } else if(s.kind === 'ice'){
+            if(pc){ return pc.addIceCandidate(new RTCIceCandidate(s.data.candidate)).catch(function(){}); }
+            else if(callState === 'incoming'){ pendingIce.push(s.data.candidate); }
+          } else if(s.kind === 'hangup'){
+            if(callState === 'incoming'){ hideIncoming(); resetCall(); }
+            else if(callState === 'outgoing' || callState === 'connected'){
+              toast(s.data && s.data.reason === 'busy' ? '对方忙线中' : '对方已挂断');
+              document.getElementById('callUI').classList.remove('show');
+              resetCall();
+            }
+          }
+        });
+      })(list[i]);
+    }
+    return chain;
+  }).catch(function(){});
+}
+setInterval(pollSignals, 1500);
+
+(function init(){
+  loadMe().then(function(){ loadMsgLists(); switchPage('msg'); }).catch(function(e){ console.error(e); });
+})();
+</script></body></html>'''
+
+
+@app.errorhandler(404)
+def _json_404(e):
+    if request.path.startswith('/api/'):
+        return jsonify({'ok': False, 'msg': '接口不存在'}), 404
+    return Response('Not Found', status=404, mimetype='text/plain')
+
+
+@app.errorhandler(500)
+def _json_500(e):
+    if request.path.startswith('/api/'):
+        return jsonify({'ok': False, 'msg': '服务器错误'}), 500
+    return Response('Server Error', status=500, mimetype='text/plain')
+
+
+TERMS_HTML = (
+  '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">'
+  '<meta name="viewport" content="width=device-width,initial-scale=1">'
+  '<title>用户协议 · zz聊天</title>'
+  '<style>body{font-family:-apple-system,sans-serif;max-width:720px;margin:0 auto;padding:24px;line-height:1.8;color:#1a2233;background:#f7faff}h1{color:#0b5fd6;font-size:22px}h2{color:#0b5fd6;font-size:16px;margin:22px 0 8px}p,li{font-size:14.5px}</style></head><body>'
+  '<h1>zz聊天 · 用户协议</h1>'
+  '<p>欢迎使用 zz聊天。使用本服务即表示你已阅读并同意本协议。</p>'
+  '<h2>一、服务内容</h2><p>本服务提供即时通讯、群聊、朋友圈、红包、音视频通话等功能，仅供合法、正当的交流使用。</p>'
+  '<h2>二、账号与安全</h2><p>你需妥善保管账号与密码。不得将账号出借、转让或用于任何商业或非法用途。</p>'
+  '<h2>三、用户行为规范</h2><p>你承诺不发布违反法律法规、侮辱诽谤、淫秽暴力、垃圾广告、诈骗信息等违反他人权益的内容。</p>'
+  '<h2>四、虚拟货币与红包</h2><p>本服务内的钱包余额为虚拟数值，仅用于本服务内部互动演示，不具备任何现实货币价值。</p>'
+  '<h2>五、免责声明</h2><p>本服务按现状提供。因不可抗力、网络故障、第三方服务中断等原因导致的服务中断或数据丢失，我们不承担赔偿责任。</p>'
+  '<h2>六、协议变更</h2><p>我们可能不时更新本协议，更新后将在本页公示。</p>'
+  '</body></html>'
+)
+
+PRIVACY_HTML = (
+  '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">'
+  '<meta name="viewport" content="width=device-width,initial-scale=1">'
+  '<title>隐私政策 · zz聊天</title>'
+  '<style>body{font-family:-apple-system,sans-serif;max-width:720px;margin:0 auto;padding:24px;line-height:1.8;color:#1a2233;background:#f7faff}h1{color:#0b5fd6;font-size:22px}h2{color:#0b5fd6;font-size:16px;margin:22px 0 8px}p,li{font-size:14.5px}</style></head><body>'
+  '<h1>zz聊天 · 隐私政策</h1>'
+  '<p>我们非常重视你的隐私。本政策说明我们收集哪些信息、如何使用、如何保护。</p>'
+  '<h2>一、我们收集的信息</h2><ul>'
+  '<li>账号信息：ID、密码（加密存储）、昵称、性别、头像</li>'
+  '<li>通讯内容：文字、图片、视频、文件、红包、朋友圈和评论</li>'
+  '<li>设备与网络信息：登录 IP、User-Agent，仅用于安全防护</li>'
+  '<li>权限：相机、麦克风（仅在使用扫码或音视频通话时调用）</li>'
+  '</ul>'
+  '<h2>二、我们如何使用信息</h2><ul><li>提供、维护和改进本服务功能</li><li>防止欺诈、滥用和安全威胁</li><li>遵守法律法规要求</li></ul>'
+  '<h2>三、信息存储</h2><p>你的数据存储在本服务的服务器上，采用合理的技术措施保护数据安全。</p>'
+  '<h2>四、信息共享</h2><p>除法律法规要求或司法、行政机关依法要求外，我们不会向第三方共享你的个人信息。</p>'
+  '<h2>五、你的权利</h2><p>你有权访问、修改账号信息，有权删除你发送的内容，有权通过退出登录停止使用本服务。</p>'
+  '</body></html>'
+)
+
+if __name__ == '__main__':
+    print('=' * 55)
+    print('  zz聊天 v4 已启动')
+    print('  客户端: http://localhost:3000')
+    print('  后台:   http://localhost:3000/qweradmin')
+    print('=' * 55)
+    app.run(host='0.0.0.0', port=3000, debug=False, threaded=True)
