@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# zz聊天 v4  ·  端口 3000  ·  后台 /qweradmin 密码 20240528
+# zz聊天 v4  ·  端口 3000  ·  后台 /qweradmin 密码 xxxxxx
 import os, hashlib, secrets, json, time, re, hashlib, random, string, sqlite3
 from datetime import datetime
 from flask import Flask, request, jsonify, session, send_from_directory, Response
